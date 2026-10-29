@@ -21,12 +21,15 @@ declare -A SIZE_MB			# executor id -> requested MB
 
 log() { echo "$(date +%T) $*"; }
 
+# cgroupfs files always report size 0, so test the content, not [ -s ]
+empty() { ! grep -q . "$1/cgroup.procs"; }
+
 cleanup() {
 	log "cleaning up"
 	for cg in "$ROOT"/exec_* "$ROOT"/shuffle; do
 		[ -d "$cg" ] || continue
 		xargs -r kill -9 < "$cg/cgroup.procs" 2>/dev/null || true
-		while [ -s "$cg/cgroup.procs" ]; do sleep 0.2; done
+		while ! empty "$cg"; do sleep 0.2; done
 		rmdir "$cg"
 	done
 	rmdir "$ROOT" 2>/dev/null || true
@@ -51,7 +54,7 @@ start_executor() {
 reap_finished() {
 	for id in "${!SIZE_MB[@]}"; do
 		local cg=$ROOT/exec_$id
-		if [ ! -s "$cg/cgroup.procs" ]; then
+		if empty "$cg"; then
 			grep -q oom_kill' [1-9]' "$cg/memory.events" && log "exec_$id was OOM-killed"
 			rmdir "$cg"
 			unset "SIZE_MB[$id]"
