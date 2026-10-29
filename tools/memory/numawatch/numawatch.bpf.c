@@ -32,6 +32,7 @@ struct {
 struct reclaim_start {
 	__u64 ts;
 	__u32 nid;
+	__u32 pad;	/* the 5.4 verifier rejects uninitialized padding */
 };
 
 struct {
@@ -98,7 +99,7 @@ int handle_kswapd_sleep(struct tp_kswapd_sleep *ctx)
 static __always_inline void record_begin(void *map, __u32 nid)
 {
 	__u32 pid = (__u32)bpf_get_current_pid_tgid();
-	struct reclaim_start rs = { .ts = bpf_ktime_get_ns(), .nid = nid };
+	struct reclaim_start rs = { .ts = bpf_ktime_get_ns(), .nid = nid, .pad = 0 };
 
 	bpf_map_update_elem(map, &pid, &rs, BPF_ANY);
 }
