@@ -35,7 +35,9 @@ $(OUTPUT):
 	mkdir -p $@
 
 $(OUTPUT)/vmlinux.h: | $(OUTPUT)
-	$(BPFTOOL) btf dump file $(VMLINUX) format c > $@
+	$(BPFTOOL) btf dump file $(VMLINUX) format c > $@.tmp
+	@test -s $@.tmp || { echo "vmlinux.h is empty: check bpftool and $(VMLINUX)" >&2; rm -f $@.tmp; exit 1; }
+	mv $@.tmp $@
 
 $(OUTPUT)/common.o: lib/common.c include/common.h | $(OUTPUT)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
