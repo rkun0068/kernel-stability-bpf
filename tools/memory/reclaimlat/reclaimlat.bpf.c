@@ -3,12 +3,12 @@
  * reclaimlat: trace Direct Reclaim latency per task.
  *
  * Hooks: tracepoint vmscan:mm_vmscan_direct_reclaim_begin / _end
- * (stable since 2.6.x; field layout resolved via CO-RE).
+ * (stable since 2.6.x; ctx layouts in include/tp_vmscan.h).
  */
-#include "vmlinux.h"
+#include <linux/types.h>
+#include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
+#include "tp_vmscan.h"
 #include "reclaimlat.h"
 
 const volatile __u32 targ_tgid = 0;
@@ -27,9 +27,11 @@ struct {
 	__type(value, struct start_info);
 } start SEC(".maps");
 
+/* perf buffer rather than ringbuf: ringbuf needs kernel >= 5.8 */
 struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 256 * 1024);
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(__u32));
 } events SEC(".maps");
 
 struct {
@@ -51,7 +53,7 @@ static __always_inline __u32 log2l(__u64 v)
 }
 
 SEC("tp/vmscan/mm_vmscan_direct_reclaim_begin")
-int handle_begin(struct trace_event_raw_mm_vmscan_direct_reclaim_begin_template *ctx)
+int handle_begin(struct tp_direct_reclaim_begin *ctx)
 {
 	__u64 id = bpf_get_current_pid_tgid();
 	__u32 pid = (__u32)id, tgid = id >> 32;
@@ -62,18 +64,18 @@ int handle_begin(struct trace_event_raw_mm_vmscan_direct_reclaim_begin_template 
 
 	si.ts = bpf_ktime_get_ns();
 	si.order = ctx->order;
-	si.gfp_flags = (__u32)ctx->gfp_flags;
+	si.gfp_flags = ctx->gfp_flags;
 	bpf_map_update_elem(&start, &pid, &si, BPF_ANY);
 	return 0;
 }
 
 SEC("tp/vmscan/mm_vmscan_direct_reclaim_end")
-int handle_end(struct trace_event_raw_mm_vmscan_direct_reclaim_end_template *ctx)
+int handle_end(struct tp_reclaim_end *ctx)
 {
 	__u64 id = bpf_get_current_pid_tgid();
 	__u32 pid = (__u32)id;
 	struct start_info *si;
-	struct event *e;
+	struct event e = {};
 	__u64 delta;
 	__u32 slot, *cnt;
 
@@ -93,17 +95,14 @@ int handle_end(struct trace_event_raw_mm_vmscan_direct_reclaim_end_template *ctx
 	if (delta < min_ns)
 		goto out;
 
-	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (!e)
-		goto out;
-	e->delta_ns = delta;
-	e->nr_reclaimed = ctx->nr_reclaimed;
-	e->pid = pid;
-	e->tgid = id >> 32;
-	e->order = si->order;
-	e->gfp_flags = si->gfp_flags;
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
-	bpf_ringbuf_submit(e, 0);
+	e.delta_ns = delta;
+	e.nr_reclaimed = ctx->nr_reclaimed;
+	e.pid = pid;
+	e.tgid = id >> 32;
+	e.order = si->order;
+	e.gfp_flags = si->gfp_flags;
+	bpf_get_current_comm(e.comm, sizeof(e.comm));
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
 out:
 	bpf_map_delete_elem(&start, &pid);
 	return 0;

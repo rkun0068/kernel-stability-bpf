@@ -2,8 +2,21 @@
 
 ## Environment
 
-Use a Linux KVM VM (not a production host) for stress experiments. Ubuntu 22.04+
-or RHEL 9 ship BTF-enabled kernels. macOS cannot build or load BPF programs.
+Use a Linux test host (not a production host) for stress experiments. macOS
+cannot build or load BPF programs.
+
+## No-BTF kernels
+
+The production kernel (elrepo kernel-lt 5.4) has no BTF, so the tools do not
+use `vmlinux.h` or CO-RE. Tracepoint context structs are written by hand in
+`include/tp_vmscan.h` from the kernel's format files:
+
+```bash
+sudo cat /sys/kernel/debug/tracing/events/vmscan/mm_vmscan_kswapd_wake/format
+```
+
+When adding a hook, copy its fields (respecting the offsets) into a header the
+same way. Avoid ringbuf (needs 5.8); use a perf event array.
 
 ## Adding a tool
 

@@ -12,6 +12,12 @@
 #include "reclaimlat.h"
 #include "reclaimlat.skel.h"
 
+#if defined(__has_include)
+#if __has_include(<bpf/libbpf_version.h>)
+#include <bpf/libbpf_version.h>
+#endif
+#endif
+
 static struct env {
 	pid_t pid;
 	__u64 min_us;
@@ -65,7 +71,7 @@ static void sig_handler(int sig)
 	exiting = 1;
 }
 
-static int handle_event(void *ctx, void *data, size_t len)
+static void handle_event(void *ctx, int cpu, void *data, __u32 size)
 {
 	const struct event *e = data;
 	char ts[16];
@@ -74,7 +80,26 @@ static int handle_event(void *ctx, void *data, size_t len)
 	printf("%-8s %-7u %-7u %-16s %-5d 0x%-8x %-12llu %10.3f\n", ts, e->tgid, e->pid,
 	       e->comm, e->order, e->gfp_flags, (unsigned long long)e->nr_reclaimed,
 	       e->delta_ns / 1e6);
-	return 0;
+}
+
+static void handle_lost(void *ctx, int cpu, __u64 cnt)
+{
+	fprintf(stderr, "lost %llu events on CPU %d\n", (unsigned long long)cnt, cpu);
+}
+
+/* perf_buffer__new() changed signature in libbpf 1.0; support 0.x too */
+static struct perf_buffer *open_perf_buffer(int map_fd)
+{
+#if defined(LIBBPF_MAJOR_VERSION) && LIBBPF_MAJOR_VERSION >= 1
+	return perf_buffer__new(map_fd, 64, handle_event, handle_lost, NULL, NULL);
+#else
+	struct perf_buffer_opts opts = {
+		.sample_cb = handle_event,
+		.lost_cb = handle_lost,
+	};
+
+	return perf_buffer__new(map_fd, 64, &opts);
+#endif
 }
 
 static void print_hist(struct reclaimlat_bpf *skel)
@@ -92,7 +117,7 @@ static void print_hist(struct reclaimlat_bpf *skel)
 int main(int argc, char **argv)
 {
 	static const struct argp argp = { .options = opts, .parser = parse_arg, .doc = doc };
-	struct ring_buffer *rb = NULL;
+	struct perf_buffer *pb = NULL;
 	struct reclaimlat_bpf *skel;
 	time_t end;
 	int err;
@@ -124,10 +149,11 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);
-	if (!rb) {
-		err = -errno;
-		fprintf(stderr, "failed to create ring buffer\n");
+	pb = open_perf_buffer(bpf_map__fd(skel->maps.events));
+	err = libbpf_get_error(pb);
+	if (err) {
+		pb = NULL;
+		fprintf(stderr, "failed to open perf buffer: %d\n", err);
 		goto cleanup;
 	}
 
@@ -141,13 +167,13 @@ int main(int argc, char **argv)
 
 	end = env.duration ? time(NULL) + env.duration : 0;
 	while (!exiting) {
-		err = ring_buffer__poll(rb, 100);
+		err = perf_buffer__poll(pb, 100);
 		if (err == -EINTR) {
 			err = 0;
 			break;
 		}
 		if (err < 0) {
-			fprintf(stderr, "ring buffer poll error: %d\n", err);
+			fprintf(stderr, "perf buffer poll error: %d\n", err);
 			break;
 		}
 		err = 0;
@@ -158,7 +184,7 @@ int main(int argc, char **argv)
 	print_hist(skel);
 
 cleanup:
-	ring_buffer__free(rb);
+	perf_buffer__free(pb);
 	reclaimlat_bpf__destroy(skel);
 	return err < 0 ? -err : err;
 }

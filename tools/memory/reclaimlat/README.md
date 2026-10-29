@@ -24,8 +24,8 @@ TIME     TGID    PID     COMM             ORDER GFP        NR_RECLAIMED   LAT(ms
 | Item | Value |
 |------|-------|
 | Hooks | `tracepoint:vmscan:mm_vmscan_direct_reclaim_begin` / `_end` |
-| Maps | `start` (hash, pid → ts), `events` (ringbuf 256K), `hist` (array, log2 µs) |
-| Requires | BTF (`/sys/kernel/btf/vmlinux`), ringbuf → kernel ≥ 5.8 |
+| Maps | `start` (hash, pid → ts), `events` (perf buffer), `hist` (array, log2 µs) |
+| Requires | kernel ≥ 5.4, no BTF. Perf buffer instead of ringbuf so it loads before 5.8 |
 | Overhead | Two tracepoint hits per reclaim; reclaim is already a slow path |
 
 ## Known limitations

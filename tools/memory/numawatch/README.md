@@ -48,7 +48,7 @@ Sample table:
 |------|-------|
 | Hooks | vmscan tracepoints only (no kprobes) |
 | Maps | `stats` per-CPU array by node (no atomics), cleared every interval |
-| Requires | BTF, kernel ≥ 5.8. node_reclaim hooks auto-skip if absent |
+| Requires | kernel ≥ 5.4, no BTF. node_reclaim hooks auto-skip if absent |
 | Overhead | Counter updates only; no per-event output |
 
 ## Known limitations

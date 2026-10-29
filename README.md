@@ -17,7 +17,9 @@ focused on memory, block I/O, network and scheduler anomalies.
 
 ## Build
 
-Linux only (kernel ≥ 5.8 with `CONFIG_DEBUG_INFO_BTF=y`).
+Linux only, kernel ≥ 5.4. Kernel BTF is not required: tracepoint layouts
+live in [include/tp_vmscan.h](include/tp_vmscan.h). Verified target:
+5.4.139-1.el7.elrepo (kernel-lt), libbpf 0.5, bpftool 5.10.
 
 ```bash
 ./scripts/setup-env.sh   # install clang, bpftool, libbpf-dev

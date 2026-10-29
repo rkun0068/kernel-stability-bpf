@@ -9,9 +9,10 @@
  *   mm_vmscan_node_reclaim_begin/end   zone_reclaim_mode stalls (optional)
  *   mm_vmscan_lru_shrink_inactive      scanned vs reclaimed per node
  */
-#include "vmlinux.h"
+#include <linux/types.h>
+#include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
+#include "tp_vmscan.h"
 #include "numawatch.h"
 
 struct {
@@ -55,7 +56,7 @@ static __always_inline struct node_stat *get_stat(__u32 nid)
 }
 
 SEC("tp/vmscan/mm_vmscan_wakeup_kswapd")
-int handle_wakeup_kswapd(struct trace_event_raw_mm_vmscan_wakeup_kswapd *ctx)
+int handle_wakeup_kswapd(struct tp_wakeup_kswapd *ctx)
 {
 	struct node_stat *s = get_stat(ctx->nid);
 
@@ -65,7 +66,7 @@ int handle_wakeup_kswapd(struct trace_event_raw_mm_vmscan_wakeup_kswapd *ctx)
 }
 
 SEC("tp/vmscan/mm_vmscan_kswapd_wake")
-int handle_kswapd_wake(struct trace_event_raw_mm_vmscan_kswapd_wake *ctx)
+int handle_kswapd_wake(struct tp_kswapd_wake *ctx)
 {
 	__u32 nid = ctx->nid;
 	__u64 ts = bpf_ktime_get_ns();
@@ -76,7 +77,7 @@ int handle_kswapd_wake(struct trace_event_raw_mm_vmscan_kswapd_wake *ctx)
 }
 
 SEC("tp/vmscan/mm_vmscan_kswapd_sleep")
-int handle_kswapd_sleep(struct trace_event_raw_mm_vmscan_kswapd_sleep *ctx)
+int handle_kswapd_sleep(struct tp_kswapd_sleep *ctx)
 {
 	__u32 nid = ctx->nid;
 	struct node_stat *s;
@@ -133,7 +134,7 @@ int handle_direct_end(void *ctx)
 }
 
 SEC("tp/vmscan/mm_vmscan_node_reclaim_begin")
-int handle_nrcl_begin(struct trace_event_raw_mm_vmscan_node_reclaim_begin *ctx)
+int handle_nrcl_begin(struct tp_node_reclaim_begin *ctx)
 {
 	record_begin(&nrcl_start, ctx->nid);
 	return 0;
@@ -163,7 +164,7 @@ int handle_nrcl_end(void *ctx)
 }
 
 SEC("tp/vmscan/mm_vmscan_lru_shrink_inactive")
-int handle_shrink_inactive(struct trace_event_raw_mm_vmscan_lru_shrink_inactive *ctx)
+int handle_shrink_inactive(struct tp_lru_shrink_inactive *ctx)
 {
 	struct node_stat *s = get_stat(ctx->nid);
 
