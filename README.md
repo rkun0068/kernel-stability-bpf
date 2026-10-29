@@ -10,6 +10,7 @@ focused on memory, block I/O, network and scheduler anomalies.
 | Memory | [reclaimlat](tools/memory/reclaimlat) | v0.1 | Direct reclaim latency |
 | Memory | alloclat | planned | Allocation slow path |
 | Memory | [numawatch](tools/memory/numawatch) | v0.1 | Per-node memory and reclaim anomalies |
+| Memory | [numaguard](tools/memory/numaguard) | v0.1 | systemd daemon: flags the NUMA node that is thrashing |
 | Disk | biolat | planned | Block I/O latency |
 | Disk | writebacklat | planned | Writeback latency |
 | Network | tcpwatch | planned | TCP retransmits / anomalies |

@@ -163,6 +163,16 @@ int handle_nrcl_end(void *ctx)
 	return 0;
 }
 
+/* kswapd threads are named "kswapd<nid>" */
+static __always_inline int is_kswapd(void)
+{
+	char comm[8];
+
+	bpf_get_current_comm(comm, sizeof(comm));
+	return comm[0] == 'k' && comm[1] == 's' && comm[2] == 'w' &&
+	       comm[3] == 'a' && comm[4] == 'p' && comm[5] == 'd';
+}
+
 SEC("tp/vmscan/mm_vmscan_lru_shrink_inactive")
 int handle_shrink_inactive(struct tp_lru_shrink_inactive *ctx)
 {
@@ -171,6 +181,8 @@ int handle_shrink_inactive(struct tp_lru_shrink_inactive *ctx)
 	if (s) {
 		s->scanned += ctx->nr_scanned;
 		s->reclaimed += ctx->nr_reclaimed;
+		if (is_kswapd())
+			s->kswapd_scanned += ctx->nr_scanned;
 	}
 	return 0;
 }

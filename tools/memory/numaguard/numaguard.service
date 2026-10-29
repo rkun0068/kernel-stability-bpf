@@ -1,0 +1,17 @@
+[Unit]
+Description=NUMA node thrashing guard
+After=local-fs.target
+
+[Service]
+# Dry run: kill verdicts are only logged. Add --enforce once validated.
+ExecStart=/usr/local/sbin/numaguard
+Restart=always
+RestartSec=5
+RuntimeDirectory=numaguard
+RuntimeDirectoryPreserve=yes
+Nice=-10
+OOMScoreAdjust=-1000
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

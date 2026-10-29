@@ -21,13 +21,14 @@ CFLAGS    ?= -g -O2 -Wall
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)
 
 # tool name -> source directory
-TOOLS := reclaimlat numawatch
+TOOLS := reclaimlat numawatch numaguard
 reclaimlat_DIR := tools/memory/reclaimlat
 numawatch_DIR  := tools/memory/numawatch
+numaguard_DIR  := tools/memory/numaguard
 
 COMMON_OBJS := $(OUTPUT)/common.o
 
-.PHONY: all clean $(TOOLS)
+.PHONY: all clean install-numaguard $(TOOLS)
 all: $(TOOLS)
 
 $(TOOLS): %: $(OUTPUT)/%
@@ -51,6 +52,14 @@ $(OUTPUT)/%.o: $$($$*_DIR)/%.c $(OUTPUT)/%.skel.h $$(wildcard $$($$*_DIR)/*.h)
 
 $(OUTPUT)/%: $(OUTPUT)/%.o $(COMMON_OBJS)
 	$(CC) $(CFLAGS) $^ $(LIBBPF_LIBS) -o $@
+
+# numaguard reuses numawatch's BPF programs
+$(OUTPUT)/numaguard.bpf.o: $(numawatch_DIR)/numawatch.bpf.c $(numawatch_DIR)/numawatch.h
+
+install-numaguard: numaguard
+	install -m 0755 $(OUTPUT)/numaguard /usr/local/sbin/numaguard
+	install -m 0644 $(numaguard_DIR)/numaguard.service /etc/systemd/system/numaguard.service
+	systemctl daemon-reload
 
 clean:
 	rm -rf $(OUTPUT)
