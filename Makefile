@@ -13,11 +13,15 @@ ARCH := $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/' \
 
 LIBBPF_CFLAGS := $(shell pkg-config --cflags libbpf 2>/dev/null)
 LIBBPF_LIBS   := $(shell pkg-config --libs libbpf 2>/dev/null || echo -lbpf) -lelf -lz
+# Version of the installed library, not of the headers: some hosts carry stray
+# libbpf_version.h files from other libbpf installs.
+LIBBPF_MAJOR  := $(or $(shell pkg-config --modversion libbpf 2>/dev/null | cut -d. -f1),1)
 
 INCLUDES  := -I$(OUTPUT) -Iinclude $(LIBBPF_CFLAGS)
 # Debian/Ubuntu keep asm/types.h under the multiarch dir
 BPF_INCLUDES := $(INCLUDES) -I/usr/include/$(shell uname -m)-linux-gnu
 CFLAGS    ?= -g -O2 -Wall
+CFLAGS    += -DLIBBPF_MAJOR=$(LIBBPF_MAJOR)
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH)
 
 # tool name -> source directory

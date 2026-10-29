@@ -12,12 +12,6 @@
 #include "reclaimlat.h"
 #include "reclaimlat.skel.h"
 
-#if defined(__has_include)
-#if __has_include(<bpf/libbpf_version.h>)
-#include <bpf/libbpf_version.h>
-#endif
-#endif
-
 static struct env {
 	pid_t pid;
 	__u64 min_us;
@@ -87,10 +81,10 @@ static void handle_lost(void *ctx, int cpu, __u64 cnt)
 	fprintf(stderr, "lost %llu events on CPU %d\n", (unsigned long long)cnt, cpu);
 }
 
-/* perf_buffer__new() changed signature in libbpf 1.0; support 0.x too */
+/* perf_buffer__new() changed signature in libbpf 1.0; LIBBPF_MAJOR comes from the Makefile */
 static struct perf_buffer *open_perf_buffer(int map_fd)
 {
-#if defined(LIBBPF_MAJOR_VERSION) && LIBBPF_MAJOR_VERSION >= 1
+#if LIBBPF_MAJOR >= 1
 	return perf_buffer__new(map_fd, 64, handle_event, handle_lost, NULL, NULL);
 #else
 	struct perf_buffer_opts opts = {
