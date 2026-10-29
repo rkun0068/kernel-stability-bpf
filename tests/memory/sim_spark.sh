@@ -7,11 +7,14 @@
 # Safety: everything is confined to one node and capped at 95% of it, the run
 # stops after MINUTES, and aborts early if host memory PSI full gets too high.
 #
-# Usage: sudo ./sim_spark.sh [node=1] [minutes=20]
+# Usage: sudo ./sim_spark.sh [node=1] [minutes=20] [cpus=node|all]
+#   cpus=all lets executors run on every CPU (like unpinned YARN containers),
+#   so the whole host stalls on the node, not just that node's CPUs.
 set -euo pipefail
 
 NODE=${1:-1}
 MINUTES=${2:-20}
+CPUS=${3:-node}
 ROOT=/sys/fs/cgroup/ksb-sim
 ABORT_PSI=60				# host memory PSI full avg10
 OVERCOMMIT=110				# executors requested, % of node memory
@@ -71,7 +74,11 @@ requested_mb() {
 # all executors share one parent pinned to the node and capped at 95% of it
 mkdir "$ROOT"
 echo "+cpuset +memory" > "$ROOT/cgroup.subtree_control"
-cat /sys/devices/system/node/node$NODE/cpulist > "$ROOT/cpuset.cpus"
+if [ "$CPUS" = all ]; then
+	cat /sys/devices/system/cpu/online > "$ROOT/cpuset.cpus"
+else
+	cat /sys/devices/system/node/node$NODE/cpulist > "$ROOT/cpuset.cpus"
+fi
 echo "$NODE" > "$ROOT/cpuset.mems"
 echo $((NODE_MB * 95 / 100))M > "$ROOT/memory.max"
 log "node$NODE: ${NODE_MB}MB, cap $((NODE_MB * 95 / 100))MB, run ${MINUTES} min"
