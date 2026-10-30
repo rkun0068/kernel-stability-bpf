@@ -329,7 +329,7 @@ static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_
 {
 	struct { __u64 cgid, pages; } top[TOP_N] = {};
 	struct alloc_key key, *prev = NULL, cur;
-	char name[128];
+	char name[256];
 	size_t used = 0;
 
 	while (!bpf_map_get_next_key(map_fd, prev, &key)) {
