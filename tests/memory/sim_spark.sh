@@ -3,7 +3,9 @@
 # like an over-committed NodeManager. For testing numawatch / numaguard.
 #
 # Each "executor" is a cgroup under /sys/fs/cgroup/ksb-sim running stress-ng
-# with a random size and lifetime, started as old ones finish (batch jobs).
+# with a random size, lifetime and YARN queue, started as old ones finish
+# (batch jobs). Like a real container, it runs in a work dir holding
+# __spark_conf__/__spark_conf__.properties with spark.yarn.queue.
 # Safety: everything is confined to one node and capped at 95% of it, the run
 # stops after MINUTES, and aborts early if host memory PSI full gets too high.
 #
@@ -18,6 +20,8 @@ CPUS=${3:-node}
 ROOT=/sys/fs/cgroup/ksb-sim
 ABORT_PSI=60				# host memory PSI full avg10
 OVERCOMMIT=110				# executors requested, % of node memory
+WORK=/tmp/ksb-sim-work
+QUEUES=(search-data-prod srda-prod szsc adhoc)
 
 NODE_MB=$(awk '/MemTotal/ {print int($4 / 1024)}' /sys/devices/system/node/node$NODE/meminfo)
 declare -A SIZE_MB			# executor id -> requested MB
@@ -36,7 +40,7 @@ cleanup() {
 		rmdir "$cg"
 	done
 	rmdir "$ROOT" 2>/dev/null || true
-	rm -rf /tmp/ksb-sim-shuffle
+	rm -rf /tmp/ksb-sim-shuffle "$WORK"
 }
 trap cleanup EXIT
 
@@ -49,9 +53,12 @@ run_in() {
 
 start_executor() {
 	local id=$1 gb=$((RANDOM % 7 + 2)) secs=$((RANDOM % 240 + 60))
+	local queue=${QUEUES[RANDOM % ${#QUEUES[@]}]} dir=$WORK/exec_$id
 	SIZE_MB[$id]=$((gb * 1024))
-	run_in "$ROOT/exec_$id" timeout "$secs" stress-ng --vm 1 --vm-bytes "${gb}G" --vm-keep -q
-	log "start exec_$id ${gb}G for ${secs}s"
+	mkdir -p "$dir/__spark_conf__"
+	echo "spark.yarn.queue=$queue" > "$dir/__spark_conf__/__spark_conf__.properties"
+	(cd "$dir" && run_in "$ROOT/exec_$id" timeout "$secs" stress-ng --vm 1 --vm-bytes "${gb}G" --vm-keep -q)
+	log "start exec_$id ${gb}G for ${secs}s queue=$queue"
 }
 
 reap_finished() {

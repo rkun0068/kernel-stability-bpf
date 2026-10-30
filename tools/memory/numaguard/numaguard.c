@@ -61,7 +61,8 @@
 #define CGROUP_ROOT	"/sys/fs/cgroup/yarn"	/* one directory per container */
 #endif
 #define TOP_N		3		/* culprits listed in a kill verdict */
-#define ACTIVE_PCT	10		/* culprit candidate: allocated >= 10% of the top one */
+#define SHARE_MIN_PCT	5		/* culprit: holds >= 5% of the thrashing node */
+#define HIGH_PRIO_SUFFIX "-prod"	/* YARN queues killed last */
 #define MAX_CONTAINERS	512
 #define RUN_DIR		"/run/numaguard"
 #define STATE_FILE	RUN_DIR "/state"
@@ -72,7 +73,7 @@ static const char *verdict_name[] = { "ok", "warn", "kill" };
 
 struct node {
 	bool online;
-	unsigned long long free_kb, file_kb, high_kb;
+	unsigned long long total_kb, free_kb, file_kb, high_kb;
 	int kswapd_pid;
 	unsigned long long kswapd_ticks;	/* utime + stime, cumulative */
 	double kswapd_pct;			/* CPU % over the last second */
@@ -107,7 +108,9 @@ static void read_nodes(void)
 		while (fgets(line, sizeof(line), f)) {
 			if (sscanf(line, "Node %*d %31[^:]: %llu", key, &val) != 2)
 				continue;
-			if (!strcmp(key, "MemFree"))
+			if (!strcmp(key, "MemTotal"))
+				n->total_kb = val;
+			else if (!strcmp(key, "MemFree"))
 				n->free_kb = val;
 			else if (!strcmp(key, "FilePages"))
 				n->file_kb = val;
@@ -313,16 +316,57 @@ static void clear_allocs(int map_fd)
 struct container {
 	__u32 ino;			/* == cgroup id (low 32 bits on 5.4) */
 	char name[200];
+	char queue[64];			/* spark.yarn.queue, "-" if unknown */
+	bool high_prio;
 	unsigned long long mem_kb;	/* memory.current */
-	unsigned long long pages;	/* allocated on the nodes in kill */
+	unsigned long long node_pages;	/* allocated on the nodes in kill */
+	unsigned long long all_pages;	/* allocated on all nodes */
+	unsigned long long node_kb;	/* estimated memory held on the nodes in kill */
 };
 
 static struct container containers[MAX_CONTAINERS];
 
+static bool read_ull(const char *path, unsigned long long *val)
+{
+	FILE *f = fopen(path, "r");
+	bool ok = f && fscanf(f, "%llu", val) == 1;
+
+	if (f)
+		fclose(f);
+	return ok;
+}
+
+/* The YARN queue, from the Spark conf in the working dir of the container's first process. */
+static void read_queue(const char *cgroup, char *queue, size_t len)
+{
+	char path[512], cwd[400], line[512];
+	unsigned long long pid;
+	ssize_t n;
+	FILE *f;
+
+	snprintf(queue, len, "-");
+	snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup);
+	if (!read_ull(path, &pid))
+		return;
+	snprintf(path, sizeof(path), "/proc/%llu/cwd", pid);
+	n = readlink(path, cwd, sizeof(cwd) - 1);
+	if (n <= 0)
+		return;
+	cwd[n] = '\0';
+	snprintf(path, sizeof(path), "%s/__spark_conf__/__spark_conf__.properties", cwd);
+	f = fopen(path, "r");
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f))	/* only this key: the file may hold credentials */
+		if (sscanf(line, "spark.yarn.queue=%63s", queue) == 1)
+			break;
+	fclose(f);
+}
+
 /* Snapshot the containers under CGROUP_ROOT; returns how many. */
 static int list_containers(void)
 {
-	char path[300];
+	char dir_path[300], path[320];
 	struct dirent *d;
 	struct stat st;
 	DIR *dir = opendir(CGROUP_ROOT);
@@ -330,55 +374,71 @@ static int list_containers(void)
 
 	while (dir && n < MAX_CONTAINERS && (d = readdir(dir))) {
 		struct container *c = &containers[n];
-		FILE *f;
+		size_t qlen;
 
-		snprintf(path, sizeof(path), CGROUP_ROOT "/%s", d->d_name);
-		if (d->d_name[0] == '.' || stat(path, &st) || !S_ISDIR(st.st_mode))
+		snprintf(dir_path, sizeof(dir_path), CGROUP_ROOT "/%s", d->d_name);
+		snprintf(path, sizeof(path), "%s/memory.current", dir_path);
+		memset(c, 0, sizeof(*c));
+		if (d->d_name[0] == '.' || stat(dir_path, &st) || !read_ull(path, &c->mem_kb))
 			continue;
-		snprintf(path, sizeof(path), CGROUP_ROOT "/%s/memory.current", d->d_name);
-		f = fopen(path, "r");
-		if (!f)
-			continue;
-		if (fscanf(f, "%llu", &c->mem_kb) == 1) {
-			c->mem_kb >>= 10;
-			c->ino = st.st_ino;
-			c->pages = 0;
-			snprintf(c->name, sizeof(c->name), "%s", d->d_name);
-			n++;
-		}
-		fclose(f);
+		c->mem_kb >>= 10;
+		c->ino = st.st_ino;
+		snprintf(c->name, sizeof(c->name), "%s", d->d_name);
+		read_queue(dir_path, c->queue, sizeof(c->queue));
+		qlen = strlen(c->queue);
+		c->high_prio = qlen >= strlen(HIGH_PRIO_SUFFIX) &&
+			       !strcmp(c->queue + qlen - strlen(HIGH_PRIO_SUFFIX), HIGH_PRIO_SUFFIX);
+		n++;
 	}
 	if (dir)
 		closedir(dir);
 	return n;
 }
 
+/* Kill order: low priority first, then the most memory on the thrashing node. */
+static bool kill_before(const struct container *a, const struct container *b)
+{
+	if (a->high_prio != b->high_prio)
+		return !a->high_prio;
+	return a->node_kb > b->node_kb;
+}
+
 /*
- * Name the containers filling the nodes in kill. Allocations on the node (BPF)
- * say who is active there; among those, memory.current says who would free the
- * most. Allocations alone would favour page-cache churn, e.g. shuffle writes.
+ * Name the containers to kill on the nodes in kill:
+ *   1. on the node: it allocated pages there since tracing started (BPF);
+ *   2. a large share: it holds >= SHARE_MIN_PCT of the node, estimated as
+ *      memory.current x its share of allocations made on that node (5.4 has
+ *      no per-node memory per cgroup; memory.current keeps page-cache churn
+ *      such as shuffle writes from looking big);
+ *   3. low priority first, then by memory held on the node.
  */
 static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_t len)
 {
 	struct alloc_key key, *prev = NULL, cur;
 	struct container *top[TOP_N] = {};
-	unsigned long long max_pages = 0;
+	unsigned long long node_total_kb = 0;
 	int n = list_containers();
 	size_t used = 0;
 
+	for (int i = 0; i < MAX_NODES; i++)
+		if (nodes[i].kill_secs >= KILL_SECS)
+			node_total_kb += nodes[i].total_kb;
+
 	while (!bpf_map_get_next_key(map_fd, prev, &key)) {
+		unsigned long long pages = 0;
+
 		cur = key;
 		prev = &cur;
-		if (key.nid >= MAX_NODES || nodes[key.nid].kill_secs < KILL_SECS ||
-		    bpf_map_lookup_elem(map_fd, &key, percpu))
+		if (key.nid >= MAX_NODES || bpf_map_lookup_elem(map_fd, &key, percpu))
 			continue;
+		for (int c = 0; c < ncpus; c++)
+			pages += percpu[c];
 		for (int i = 0; i < n; i++) {
 			if (containers[i].ino != (__u32)key.cgid)
 				continue;
-			for (int c = 0; c < ncpus; c++)
-				containers[i].pages += percpu[c];
-			if (containers[i].pages > max_pages)
-				max_pages = containers[i].pages;
+			containers[i].all_pages += pages;
+			if (nodes[key.nid].kill_secs >= KILL_SECS)
+				containers[i].node_pages += pages;
 			break;
 		}
 	}
@@ -386,21 +446,25 @@ static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_
 	for (int i = 0; i < n; i++) {
 		struct container *c = &containers[i];
 
-		if (!c->pages || c->pages * 100 < max_pages * ACTIVE_PCT)
-			continue;
+		if (!c->node_pages)
+			continue;				/* 1. not on the node */
+		c->node_kb = c->mem_kb * c->node_pages / c->all_pages;
+		if (c->node_kb * 100 < node_total_kb * SHARE_MIN_PCT)
+			continue;				/* 2. small share */
 		for (int t = 0; t < TOP_N; t++) {
-			if (top[t] && c->mem_kb <= top[t]->mem_kb)
+			if (top[t] && !kill_before(c, top[t]))
 				continue;
 			memmove(&top[t + 1], &top[t], (TOP_N - t - 1) * sizeof(top[0]));
-			top[t] = c;
+			top[t] = c;				/* 3. kill order */
 			break;
 		}
 	}
 
 	out[0] = '\0';
 	for (int t = 0; t < TOP_N && top[t] && used < len; t++)
-		used += snprintf(out + used, len - used, "%s%s:%lluM", used ? "," : "",
-				 top[t]->name, top[t]->mem_kb >> 10);
+		used += snprintf(out + used, len - used, "%s%s(queue=%s,%s,node=%lluM)",
+				 used ? "," : "", top[t]->name, top[t]->queue,
+				 top[t]->high_prio ? "high" : "low", top[t]->node_kb >> 10);
 }
 
 /* Write the state file; log the evidence whenever the verdict changes. */
