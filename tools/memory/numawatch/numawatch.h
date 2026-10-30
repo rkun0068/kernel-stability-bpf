@@ -17,7 +17,6 @@ struct node_stat {
 	__u64 nrcl_max_ns;
 	__u64 scanned;		/* inactive LRU pages scanned on this node */
 	__u64 reclaimed;
-	__u64 kswapd_scanned;	/* part of scanned done by kswapd */
 };
 
 #endif

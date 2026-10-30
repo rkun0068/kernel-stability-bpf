@@ -3,15 +3,17 @@
  * numaguard: detect the NUMA-node thrashing that precedes a host hang and
  * publish a verdict for the NodeManager in /run/numaguard/state.
  *
- *   warn: a node's kswapd has stopped scanning while the node's free memory
- *         stays below its high watermark, for 10 minutes.
- *   kill: the host is stalled on IO (IO PSI full and iowait) and a node has
- *         no page cache left, free memory near its high watermark, heavy
- *         scanning and almost nothing reclaimed, for 60 seconds.
+ *   warn: a node's kswapd is idle while the node's free memory stays below
+ *         its high watermark, for 10 minutes.
+ *   kill: the host is stalled on IO (IO PSI full and iowait), the host scans
+ *         hard but reclaims almost nothing, and a node has no page cache left
+ *         and free memory near its high watermark, for 60 seconds.
  *
- * Without --enforce (dry run) a kill verdict is only logged; the state file
- * says warn.
+ * Reads procfs/sysfs only (no BPF), the same sources as sar and atop that the
+ * thresholds come from. Without --enforce (dry run) a kill verdict is only
+ * logged; the state file says warn.
  */
+#include <dirent.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,10 +22,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
-#include "../numawatch/numawatch.h"
-#include "numaguard.skel.h"
 
 /* Thresholds, from 5 hangs on 4 hosts. See README.md. */
 #define WARN_SECS	600
@@ -31,12 +29,13 @@
 #define KILL_HOLD_SECS	300		/* keep a kill verdict at least this long */
 #define IO_FULL_MIN	80.0		/* /proc/pressure/io full avg10 */
 #define IOWAIT_MIN	80.0		/* % of CPU time */
-#define FILE_MAX_KB	(1ULL << 20)	/* page cache below 1G */
-#define FREE_MARGIN_KB	(1ULL << 20)	/* free below high watermark + 1G */
-#define SCAN_MIN	600000		/* pages scanned per second */
+#define SCAN_MIN	600000		/* host pages scanned per second */
 #define EFF_MAX		10		/* % of scanned pages reclaimed */
-#define KSWAPD_IDLE	100		/* kswapd pages scanned per second */
+#define FILE_MAX_KB	(1ULL << 20)	/* node page cache below 1G */
+#define FREE_MARGIN_KB	(1ULL << 20)	/* node free below high watermark + 1G */
+#define KSWAPD_IDLE_PCT	1.0		/* kswapd CPU %, as atop shows it */
 
+#define MAX_NODES	64
 #define RUN_DIR		"/run/numaguard"
 #define STATE_FILE	RUN_DIR "/state"
 #define EVENT_LOG	RUN_DIR "/events.log"
@@ -46,13 +45,21 @@ static const char *verdict_name[] = { "ok", "warn", "kill" };
 
 struct node {
 	bool online;
-	__u64 free_kb, file_kb, high_kb;
-	__u64 scanned, reclaimed, kswapd_scanned;	/* pages, last second */
-	int warn_secs, kill_secs;			/* how long each rule held */
+	unsigned long long free_kb, file_kb, high_kb;
+	int kswapd_pid;
+	unsigned long long kswapd_ticks;	/* utime + stime, cumulative */
+	double kswapd_pct;			/* CPU % over the last second */
+	int warn_secs, kill_secs;		/* how long each rule held */
 };
 
-static struct node nodes[NUMA_MAX_NODES];
-static long page_kb;
+/* host-wide, over the last second */
+struct host {
+	double io_full, iowait;
+	unsigned long long scanned, reclaimed;
+};
+
+static struct node nodes[MAX_NODES];
+static long page_kb, clk_tck;
 
 static void read_nodes(void)
 {
@@ -61,7 +68,7 @@ static void read_nodes(void)
 	int nid = -1;
 	FILE *f;
 
-	for (int i = 0; i < NUMA_MAX_NODES; i++) {
+	for (int i = 0; i < MAX_NODES; i++) {
 		struct node *n = &nodes[i];
 
 		snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", i);
@@ -88,67 +95,112 @@ static void read_nodes(void)
 	while (fgets(line, sizeof(line), f)) {
 		if (sscanf(line, "Node %d, zone", &nid) == 1)
 			continue;
-		if (nid >= 0 && nid < NUMA_MAX_NODES && sscanf(line, " high %llu", &val) == 1)
+		if (nid >= 0 && nid < MAX_NODES && sscanf(line, " high %llu", &val) == 1)
 			nodes[nid].high_kb += val * page_kb;
 	}
 	fclose(f);
 }
 
-/* Per-node scan counters from BPF, summed over CPUs and then reset. */
-static void read_bpf(int map_fd, struct node_stat *percpu, int ncpus)
+/* kswapd threads are named "kswapd<nid>"; find their pids once at startup */
+static void find_kswapds(void)
 {
-	for (__u32 nid = 0; nid < NUMA_MAX_NODES; nid++) {
-		struct node *n = &nodes[nid];
+	char path[64], comm[32];
+	struct dirent *d;
+	DIR *proc = opendir("/proc");
+	int nid;
 
-		n->scanned = n->reclaimed = n->kswapd_scanned = 0;
-		if (!n->online || bpf_map_lookup_elem(map_fd, &nid, percpu))
+	while (proc && (d = readdir(proc))) {
+		FILE *f;
+
+		snprintf(path, sizeof(path), "/proc/%s/comm", d->d_name);
+		f = fopen(path, "r");
+		if (!f)
 			continue;
-		for (int c = 0; c < ncpus; c++) {
-			n->scanned += percpu[c].scanned;
-			n->reclaimed += percpu[c].reclaimed;
-			n->kswapd_scanned += percpu[c].kswapd_scanned;
+		if (fscanf(f, "%31s", comm) == 1 && sscanf(comm, "kswapd%d", &nid) == 1 &&
+		    nid >= 0 && nid < MAX_NODES)
+			nodes[nid].kswapd_pid = atoi(d->d_name);
+		fclose(f);
+	}
+	if (proc)
+		closedir(proc);
+}
+
+static void read_kswapds(void)
+{
+	char path[64], buf[512], *p;
+
+	for (int i = 0; i < MAX_NODES; i++) {
+		struct node *n = &nodes[i];
+		unsigned long long utime, stime, ticks;
+		FILE *f;
+
+		if (!n->kswapd_pid)
+			continue;
+		snprintf(path, sizeof(path), "/proc/%d/stat", n->kswapd_pid);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		/* skip "pid (comm) state" plus 10 fields to reach utime, stime */
+		if (fgets(buf, sizeof(buf), f) && (p = strrchr(buf, ')')) &&
+		    sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+			   &utime, &stime) == 2) {
+			ticks = utime + stime;
+			if (n->kswapd_ticks)
+				n->kswapd_pct = 100.0 * (ticks - n->kswapd_ticks) / clk_tck;
+			n->kswapd_ticks = ticks;
 		}
-		memset(percpu, 0, ncpus * sizeof(*percpu));
-		bpf_map_update_elem(map_fd, &nid, percpu, BPF_ANY);
+		fclose(f);
 	}
 }
 
-static double read_io_full(void)
+static void read_host(struct host *h)
 {
-	char line[128];
-	double avg10 = 0;
-	FILE *f = fopen("/proc/pressure/io", "r");
+	static unsigned long long prev_wait, prev_total, prev_scan, prev_steal;
+	unsigned long long v[8], total = 0, scan = 0, steal = 0, val;
+	char line[128], key[64];
+	FILE *f;
 
-	if (!f)
-		return 0;
-	while (fgets(line, sizeof(line), f))
-		if (sscanf(line, "full avg10=%lf", &avg10) == 1)
-			break;
-	fclose(f);
-	return avg10;
-}
-
-/* iowait as % of all CPU time since the previous call */
-static double read_iowait(void)
-{
-	static unsigned long long prev_wait, prev_total;
-	unsigned long long v[8], total = 0;
-	double pct = 0;
-	FILE *f = fopen("/proc/stat", "r");
-
-	if (!f)
-		return 0;
-	if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-		   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) {
-		for (int i = 0; i < 8; i++)
-			total += v[i];
-		if (total > prev_total)
-			pct = 100.0 * (v[4] - prev_wait) / (total - prev_total);
-		prev_wait = v[4];
-		prev_total = total;
+	h->io_full = 0;
+	f = fopen("/proc/pressure/io", "r");
+	if (f) {
+		while (fgets(line, sizeof(line), f))
+			if (sscanf(line, "full avg10=%lf", &h->io_full) == 1)
+				break;
+		fclose(f);
 	}
-	fclose(f);
-	return pct;
+
+	h->iowait = 0;
+	f = fopen("/proc/stat", "r");
+	if (f) {
+		if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+			   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) {
+			for (int i = 0; i < 8; i++)
+				total += v[i];
+			if (prev_total && total > prev_total)
+				h->iowait = 100.0 * (v[4] - prev_wait) / (total - prev_total);
+			prev_wait = v[4];
+			prev_total = total;
+		}
+		fclose(f);
+	}
+
+	/* sar -B's pgscank+pgscand and pgsteal */
+	f = fopen("/proc/vmstat", "r");
+	if (f) {
+		while (fgets(line, sizeof(line), f)) {
+			if (sscanf(line, "%63s %llu", key, &val) != 2)
+				continue;
+			if (!strcmp(key, "pgscan_kswapd") || !strcmp(key, "pgscan_direct"))
+				scan += val;
+			else if (!strcmp(key, "pgsteal_kswapd") || !strcmp(key, "pgsteal_direct"))
+				steal += val;
+		}
+		fclose(f);
+		h->scanned = prev_scan ? scan - prev_scan : 0;
+		h->reclaimed = prev_steal ? steal - prev_steal : 0;
+		prev_scan = scan;
+		prev_steal = steal;
+	}
 }
 
 static void append_node(char *list, size_t len, int nid)
@@ -159,23 +211,22 @@ static void append_node(char *list, size_t len, int nid)
 }
 
 /* Advance each node's rule timers; return the verdict and the nodes behind it. */
-static enum verdict evaluate(double io_full, double iowait, char *who, size_t len)
+static enum verdict evaluate(const struct host *h, char *who, size_t len)
 {
-	bool host_stalled = io_full >= IO_FULL_MIN && iowait >= IOWAIT_MIN;
+	bool host_stalled = h->io_full >= IO_FULL_MIN && h->iowait >= IOWAIT_MIN &&
+			    h->scanned >= SCAN_MIN &&
+			    h->reclaimed * 100 <= h->scanned * EFF_MAX;
 	char warn_nodes[64] = "", kill_nodes[64] = "";
 
-	for (int i = 0; i < NUMA_MAX_NODES; i++) {
+	for (int i = 0; i < MAX_NODES; i++) {
 		struct node *n = &nodes[i];
 		bool kswapd_stopped, thrashing;
 
 		if (!n->online)
 			continue;
 
-		kswapd_stopped = n->kswapd_scanned < KSWAPD_IDLE && n->free_kb < n->high_kb;
-		thrashing = n->file_kb < FILE_MAX_KB &&
-			    n->free_kb < n->high_kb + FREE_MARGIN_KB &&
-			    n->scanned >= SCAN_MIN &&
-			    n->reclaimed * 100 <= n->scanned * EFF_MAX;
+		kswapd_stopped = n->kswapd_pct < KSWAPD_IDLE_PCT && n->free_kb < n->high_kb;
+		thrashing = n->file_kb < FILE_MAX_KB && n->free_kb < n->high_kb + FREE_MARGIN_KB;
 
 		n->warn_secs = kswapd_stopped ? n->warn_secs + 1 : 0;
 		n->kill_secs = host_stalled && thrashing ? n->kill_secs + 1 : 0;
@@ -195,7 +246,7 @@ static enum verdict evaluate(double io_full, double iowait, char *who, size_t le
 }
 
 /* Write the state file; log the evidence whenever the verdict changes. */
-static void publish(enum verdict v, const char *who, bool enforce, double io_full, double iowait)
+static void publish(enum verdict v, const char *who, bool enforce, const struct host *h)
 {
 	static char last[80];
 	enum verdict shown = (v == KILL && !enforce) ? WARN : v;
@@ -217,15 +268,15 @@ static void publish(enum verdict v, const char *who, bool enforce, double io_ful
 	f = fopen(EVENT_LOG, "a");
 	if (!f)
 		return;
-	fprintf(f, "%ld verdict=%s nodes=%s dry_run=%d io_full=%.0f iowait=%.0f",
-		(long)time(NULL), verdict_name[v], who, !enforce, io_full, iowait);
-	for (int i = 0; i < NUMA_MAX_NODES; i++) {
+	fprintf(f, "%ld verdict=%s nodes=%s dry_run=%d io_full=%.0f iowait=%.0f scan=%llu eff=%llu%%",
+		(long)time(NULL), verdict_name[v], who, !enforce, h->io_full, h->iowait, h->scanned,
+		h->scanned ? h->reclaimed * 100 / h->scanned : 100);
+	for (int i = 0; i < MAX_NODES; i++) {
 		const struct node *n = &nodes[i];
 
 		if (n->online)
-			fprintf(f, " node%d:free=%lluM,high=%lluM,file=%lluM,scan=%llu,eff=%llu%%,kswapd_scan=%llu",
-				i, n->free_kb >> 10, n->high_kb >> 10, n->file_kb >> 10, n->scanned,
-				n->scanned ? n->reclaimed * 100 / n->scanned : 100, n->kswapd_scanned);
+			fprintf(f, " node%d:free=%lluM,high=%lluM,file=%lluM,kswapd=%.0f%%",
+				i, n->free_kb >> 10, n->high_kb >> 10, n->file_kb >> 10, n->kswapd_pct);
 	}
 	fprintf(f, "\n");
 	fclose(f);
@@ -235,47 +286,25 @@ int main(int argc, char **argv)
 {
 	bool enforce = argc > 1 && !strcmp(argv[1], "--enforce");
 	enum verdict v, prev = OK;
-	struct numaguard_bpf *skel;
-	struct bpf_program *prog;
-	struct node_stat *percpu;
 	char who[64] = "", buf[64];
 	time_t kill_since = 0;
-	int ncpus;
+	struct host h;
 
 	/* Must keep running while memory thrashes: never page ourselves out. */
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
 		perror("mlockall");
 	mkdir(RUN_DIR, 0755);
 	page_kb = sysconf(_SC_PAGESIZE) / 1024;
-	ncpus = libbpf_num_possible_cpus();
-	percpu = calloc(ncpus, sizeof(*percpu));
-	if (ncpus <= 0 || !percpu)
-		return 1;
+	clk_tck = sysconf(_SC_CLK_TCK);
+	find_kswapds();
 
-	skel = numaguard_bpf__open();
-	if (!skel)
-		return 1;
-	/* only the per-node scan counters are needed */
-	bpf_object__for_each_program(prog, skel->obj)
-		if (strcmp(bpf_program__name(prog), "handle_shrink_inactive"))
-			bpf_program__set_autoload(prog, false);
-	if (numaguard_bpf__load(skel) || numaguard_bpf__attach(skel)) {
-		fprintf(stderr, "failed to load BPF programs\n");
-		numaguard_bpf__destroy(skel);
-		return 1;
-	}
-
-	read_iowait();	/* first sample is the baseline */
 	for (;;) {
-		double io_full, iowait;
 		time_t now;
 
-		sleep(1);
 		read_nodes();
-		read_bpf(bpf_map__fd(skel->maps.stats), percpu, ncpus);
-		io_full = read_io_full();
-		iowait = read_iowait();
-		v = evaluate(io_full, iowait, buf, sizeof(buf));
+		read_kswapds();
+		read_host(&h);
+		v = evaluate(&h, buf, sizeof(buf));
 
 		now = time(NULL);
 		if (prev == KILL && v != KILL && now - kill_since < KILL_HOLD_SECS)
@@ -286,6 +315,7 @@ int main(int argc, char **argv)
 			kill_since = now;
 		prev = v;
 
-		publish(v, who, enforce, io_full, iowait);
+		publish(v, who, enforce, &h);
+		sleep(1);
 	}
 }

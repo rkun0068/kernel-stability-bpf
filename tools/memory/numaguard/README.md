@@ -10,12 +10,13 @@ Checked every second. Thresholds are constants at the top of `numaguard.c`.
 
 | Verdict | Condition | Held for |
 |---------|-----------|----------|
-| `warn` | a node's kswapd scans < 100 pages/s **and** its free memory < high watermark | 10 min |
-| `kill` | host: IO PSI full avg10 ≥ 80 **and** iowait ≥ 80%;<br>same node: page cache < 1G **and** free < high + 1G **and** scan ≥ 600k pages/s **and** reclaimed ≤ 10% of scanned | 60 s |
+| `warn` | a node's kswapd CPU < 1% **and** its free memory < high watermark | 10 min |
+| `kill` | host: IO PSI full avg10 ≥ 80 **and** iowait ≥ 80% **and** scan ≥ 600k pages/s **and** reclaimed ≤ 10% of scanned;<br>node: page cache < 1G **and** free < high + 1G | 60 s |
 
 A `kill` verdict is kept for at least 5 minutes so NM has time to act.
-The node whose kswapd stopped never reaches `kill`: it scans almost nothing,
-so it stays under the scan floor.
+Sources are the ones the thresholds came from: scan and reclaim are host-wide
+`/proc/vmstat` (sar -B), kswapd CPU is `/proc/<kswapdN>/stat` (atop PRC).
+The node whose kswapd stopped still has page cache, so it does not reach `kill`.
 
 ## Output
 
@@ -46,5 +47,5 @@ cat /run/numaguard/state
 
 The guard must keep working while the host thrashes: it `mlockall()`s itself,
 allocates nothing in the loop, writes only to `/run`, and runs with
-`OOMScoreAdjust=-1000` and `Nice=-10`. It loads one BPF program
-(`mm_vmscan_lru_shrink_inactive`) and reads a few procfs/sysfs files per second.
+`OOMScoreAdjust=-1000` and `Nice=-10`. It uses no BPF (so no JIT dependency)
+and reads a few procfs/sysfs files per second.
