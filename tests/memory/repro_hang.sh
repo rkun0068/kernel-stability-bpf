@@ -10,11 +10,15 @@
 #      keeps making progress, so it never OOMs.
 #   3. numaguard --enforce (built with CGROUP_ROOT=$ROOT/yarn) judges; the mock NM
 #      kills the first culprit on every new kill verdict, at most 3 times.
+#      GUARD=none skips this step: the baseline run to compare against.
+#
+# A probe in the root cgroup does a 4K O_DIRECT read every 5s, as any process on
+# the host would when it misses the page cache; its latency is how hung the host is.
 #
 # Safety: every process runs under timeout -s KILL, so all memory is freed after
 # MINUTES even if the host is too stalled to reach.
 #
-# Usage: sudo ./repro_hang.sh <numaguard binary> [node=1] [minutes=15]
+# Usage: sudo [READERS=300] [ROOM_MB=800] ./repro_hang.sh <numaguard binary|none> [node=1] [minutes=15]
 set -euo pipefail
 
 GUARD=$1
@@ -24,16 +28,20 @@ ROOT=/sys/fs/cgroup/ksb-repro
 YARN=$ROOT/yarn				# executors only, like the NM's cgroup
 WORK=/tmp/ksb-repro
 FILES_GB=3
-READERS=48
+READERS=${READERS:-300}
 WRITERS=8
 EXECUTORS=8
+ROOM_MB=${ROOM_MB:-800}			# node memory left for page cache
+PROBE_PID=
+PROBE_LOG=/tmp/ksb-probe-$(basename "$GUARD").log
 QUEUES=(search-data-prod srda-prod szsc adhoc)
 
 log() { echo "$(date +%T) $*"; }
 
 cleanup() {
 	log "cleaning up"
-	pkill -f "$GUARD" || true
+	[ "$GUARD" = none ] || pkill -f "$GUARD" || true
+	kill $PROBE_PID 2>/dev/null || true
 	for procs in $(find "$ROOT" -name cgroup.procs 2>/dev/null); do
 		xargs -r kill -9 < "$procs" 2>/dev/null || true
 	done
@@ -59,6 +67,7 @@ log "writing ${FILES_GB}G file set"
 for i in $(seq $((FILES_GB * 4))); do
 	dd if=/dev/urandom of="$WORK/files/f$i" bs=1M count=256 status=none
 done
+dd if=/dev/urandom of="$WORK/probe" bs=1M count=1024 status=none
 sync; echo 1 > /proc/sys/vm/drop_caches
 
 mkdir "$ROOT"
@@ -68,8 +77,8 @@ echo "$NODE" > "$ROOT/cpuset.mems"
 mkdir "$YARN"
 echo "+cpuset +memory" > "$YARN/cgroup.subtree_control"
 
-# 1. executors: everything reclaimable on the node except 1.5G
-fill_mb=$(( $(meminfo MemFree) + $(meminfo FilePages) - 1500 ))
+# 1. executors: everything reclaimable on the node except ROOM_MB
+fill_mb=$(( $(meminfo MemFree) + $(meminfo FilePages) - ROOM_MB ))
 log "node$NODE: filling ${fill_mb}MB with $EXECUTORS executors"
 for id in $(seq $EXECUTORS); do
 	queue=${QUEUES[RANDOM % ${#QUEUES[@]}]}
@@ -89,9 +98,19 @@ for r in $(seq $READERS); do
 	run_in "$ROOT/readers" "$WORK" sh -c "while :; do cat files/* > /dev/null; done"
 done
 
+# probe: "<epoch> <ms>" per read
+: > "$PROBE_LOG"
+while :; do
+	t=$(date +%s%N)
+	dd if="$WORK/probe" of=/dev/null bs=4k count=1 skip=$((RANDOM * 8)) iflag=direct status=none
+	echo "$(date +%s) $((($(date +%s%N) - t) / 1000000))" >> "$PROBE_LOG"
+	sleep 5
+done &
+PROBE_PID=$!
+
 # 3. numaguard and the mock NodeManager
 rm -f /run/numaguard/state /run/numaguard/events.log
-setsid "$GUARD" --enforce < /dev/null > /dev/null 2>&1 &
+[ "$GUARD" = none ] || setsid "$GUARD" --enforce < /dev/null > /dev/null 2>&1 &
 kills=0 last= next_log=0
 end=$((SECONDS + MINUTES * 60))
 while [ $SECONDS -lt $end ]; do
@@ -104,8 +123,10 @@ while [ $SECONDS -lt $end ]; do
 		last=$victim kills=$((kills + 1))
 	fi
 	if [ $SECONDS -ge $next_log ]; then
-		log "io $(grep full /proc/pressure/io | cut -d' ' -f2) node$NODE free=$(meminfo MemFree)M file=$(meminfo FilePages)M dirty=$(meminfo Dirty)M ${state%% nodes*}"
+		log "io $(grep full /proc/pressure/io | cut -d' ' -f2) D=$(grep -l '^State:.D' /proc/[0-9]*/status 2>/dev/null | wc -l) probe=$(tail -1 "$PROBE_LOG" | cut -d' ' -f2)ms node$NODE free=$(meminfo MemFree)M file=$(meminfo FilePages)M dirty=$(meminfo Dirty)M ${state%% nodes*}"
 		next_log=$((SECONDS + 30))
 	fi
 done
 log "done, kills=$kills"
+awk '{n++; s += $2; if ($2 > max) max = $2; if ($2 >= 1000) slow++}
+	END {printf "probe: %d reads, avg %dms, max %dms, %d >= 1s\n", n, s / n, max, slow}' "$PROBE_LOG"
