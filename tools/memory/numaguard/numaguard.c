@@ -61,6 +61,8 @@
 #define CGROUP_ROOT	"/sys/fs/cgroup/yarn"	/* one directory per container */
 #endif
 #define TOP_N		3		/* culprits listed in a kill verdict */
+#define ACTIVE_PCT	10		/* culprit candidate: allocated >= 10% of the top one */
+#define MAX_CONTAINERS	512
 #define RUN_DIR		"/run/numaguard"
 #define STATE_FILE	RUN_DIR "/state"
 #define EVENT_LOG	RUN_DIR "/events.log"
@@ -308,62 +310,97 @@ static void clear_allocs(int map_fd)
 		bpf_map_delete_elem(map_fd, &key);
 }
 
-/* A container's cgroup id is its directory's inode (low 32 bits on 5.4). */
-static void container_name(__u64 cgid, char *name, size_t len)
+struct container {
+	__u32 ino;			/* == cgroup id (low 32 bits on 5.4) */
+	char name[200];
+	unsigned long long mem_kb;	/* memory.current */
+	unsigned long long pages;	/* allocated on the nodes in kill */
+};
+
+static struct container containers[MAX_CONTAINERS];
+
+/* Snapshot the containers under CGROUP_ROOT; returns how many. */
+static int list_containers(void)
 {
 	char path[300];
 	struct dirent *d;
 	struct stat st;
 	DIR *dir = opendir(CGROUP_ROOT);
+	int n = 0;
 
-	snprintf(name, len, "cgroup-%llu", (unsigned long long)cgid);
-	while (dir && (d = readdir(dir))) {
+	while (dir && n < MAX_CONTAINERS && (d = readdir(dir))) {
+		struct container *c = &containers[n];
+		FILE *f;
+
 		snprintf(path, sizeof(path), CGROUP_ROOT "/%s", d->d_name);
-		if (d->d_name[0] != '.' && !stat(path, &st) && (__u32)st.st_ino == (__u32)cgid) {
-			snprintf(name, len, "%s", d->d_name);
-			break;
+		if (d->d_name[0] == '.' || stat(path, &st) || !S_ISDIR(st.st_mode))
+			continue;
+		snprintf(path, sizeof(path), CGROUP_ROOT "/%s/memory.current", d->d_name);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (fscanf(f, "%llu", &c->mem_kb) == 1) {
+			c->mem_kb >>= 10;
+			c->ino = st.st_ino;
+			c->pages = 0;
+			snprintf(c->name, sizeof(c->name), "%s", d->d_name);
+			n++;
 		}
+		fclose(f);
 	}
 	if (dir)
 		closedir(dir);
+	return n;
 }
 
-/* List the TOP_N containers that allocated most on the nodes in kill. */
+/*
+ * Name the containers filling the nodes in kill. Allocations on the node (BPF)
+ * say who is active there; among those, memory.current says who would free the
+ * most. Allocations alone would favour page-cache churn, e.g. shuffle writes.
+ */
 static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_t len)
 {
-	struct { __u64 cgid, pages; } top[TOP_N] = {};
 	struct alloc_key key, *prev = NULL, cur;
-	char name[256];
+	struct container *top[TOP_N] = {};
+	unsigned long long max_pages = 0;
+	int n = list_containers();
 	size_t used = 0;
 
 	while (!bpf_map_get_next_key(map_fd, prev, &key)) {
-		__u64 pages = 0;
-
 		cur = key;
 		prev = &cur;
 		if (key.nid >= MAX_NODES || nodes[key.nid].kill_secs < KILL_SECS ||
 		    bpf_map_lookup_elem(map_fd, &key, percpu))
 			continue;
-		for (int c = 0; c < ncpus; c++)
-			pages += percpu[c];
+		for (int i = 0; i < n; i++) {
+			if (containers[i].ino != (__u32)key.cgid)
+				continue;
+			for (int c = 0; c < ncpus; c++)
+				containers[i].pages += percpu[c];
+			if (containers[i].pages > max_pages)
+				max_pages = containers[i].pages;
+			break;
+		}
+	}
+
+	for (int i = 0; i < n; i++) {
+		struct container *c = &containers[i];
+
+		if (!c->pages || c->pages * 100 < max_pages * ACTIVE_PCT)
+			continue;
 		for (int t = 0; t < TOP_N; t++) {
-			if (pages <= top[t].pages)
+			if (top[t] && c->mem_kb <= top[t]->mem_kb)
 				continue;
 			memmove(&top[t + 1], &top[t], (TOP_N - t - 1) * sizeof(top[0]));
-			top[t].cgid = key.cgid;
-			top[t].pages = pages;
+			top[t] = c;
 			break;
 		}
 	}
 
 	out[0] = '\0';
-	for (int t = 0; t < TOP_N && top[t].pages; t++) {
-		container_name(top[t].cgid, name, sizeof(name));
-		used += snprintf(out + used, len - used, "%s%s:%lluM", used ? "," : "", name,
-				 (unsigned long long)(top[t].pages * page_kb >> 10));
-		if (used >= len)
-			break;
-	}
+	for (int t = 0; t < TOP_N && top[t] && used < len; t++)
+		used += snprintf(out + used, len - used, "%s%s:%lluM", used ? "," : "",
+				 top[t]->name, top[t]->mem_kb >> 10);
 }
 
 /* Write the state file; log the evidence whenever the verdict changes. */
