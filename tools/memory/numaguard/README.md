@@ -2,7 +2,8 @@
 
 Daemon that detects the NUMA-node thrashing that precedes a host hang
 (no swap, kernel never OOMs, IO PSI full ~90%) and tells the NodeManager
-which node is thrashing. It only decides; killing containers is NM's job.
+which node is thrashing and which containers are filling it. It only decides;
+killing containers is NM's job.
 
 ## Rules
 
@@ -23,8 +24,25 @@ The node whose kswapd stopped still has page cache, so it does not reach `kill`.
 `/run/numaguard/state` (tmpfs, replaced atomically):
 
 ```
-state=kill nodes=1 since=1761000000
+state=kill nodes=1 culprits=container_e2041_..._000826:9214M,container_..._001015:3120M since=1761000000
 ```
+
+`culprits` are the (up to 3) containers under `/sys/fs/cgroup/yarn` that
+allocated the most pages on the thrashing node since tracing started. They are
+ranked once, when the kill verdict starts; NM can apply its own priority on top.
+
+## Finding culprits (BPF)
+
+Containers are not bound to nodes, and 5.4 has no `memory.numa_stat`, so the
+only cheap way to know who fills a node is to watch page allocations:
+`kmem:mm_page_alloc` → (cgroup id, node from pfn) → pages, in a per-CPU hash.
+Page allocation is a hot path and the hosts run without BPF JIT, so the program
+is attached only while a node is in `warn` or is counting towards `kill`, and
+detached when everything is `ok` again. If BPF fails to load, the verdicts still
+work and `culprits` stays empty.
+
+Counts are gross allocations (frees are not subtracted), so page-cache churn
+counts too; the container growing its heap fastest still ranks first.
 
 `/run/numaguard/events.log`: one line with all metrics each time the verdict changes.
 
@@ -47,5 +65,5 @@ cat /run/numaguard/state
 
 The guard must keep working while the host thrashes: it `mlockall()`s itself,
 allocates nothing in the loop, writes only to `/run`, and runs with
-`OOMScoreAdjust=-1000` and `Nice=-10`. It uses no BPF (so no JIT dependency)
-and reads a few procfs/sysfs files per second.
+`OOMScoreAdjust=-1000` and `Nice=-10`. Normally it only reads a few procfs/sysfs
+files per second; the BPF program runs only around an incident.

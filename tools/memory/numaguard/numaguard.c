@@ -9,9 +9,14 @@
  *         hard but reclaims almost nothing, and a node has no page cache left
  *         and free memory near its high watermark, for 60 seconds.
  *
- * Reads procfs/sysfs only (no BPF), the same sources as sar and atop that the
- * thresholds come from. Without --enforce (dry run) a kill verdict is only
- * logged; the state file says warn.
+ * The verdict itself comes from procfs/sysfs, the same sources as sar and
+ * atop that the thresholds come from. To name the culprits, a BPF program
+ * counts pages allocated per (container, node); it is attached only while a
+ * node is heading for a hang, and a kill verdict lists the containers that
+ * allocated most on the thrashing node.
+ *
+ * Without --enforce (dry run) a kill verdict is only logged; the state file
+ * says warn.
  */
 #include <dirent.h>
 #include <stdbool.h>
@@ -22,20 +27,36 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include "numaguard.h"
+#include "numaguard.skel.h"
 
 /* Thresholds, from 5 hangs on 4 hosts. See README.md. */
 #define WARN_SECS	600
 #define KILL_SECS	60
 #define KILL_HOLD_SECS	300		/* keep a kill verdict at least this long */
-#define IO_FULL_MIN	80.0		/* /proc/pressure/io full avg10 */
-#define IOWAIT_MIN	80.0		/* % of CPU time */
-#define SCAN_MIN	600000		/* host pages scanned per second */
-#define EFF_MAX		10		/* % of scanned pages reclaimed */
 #define FILE_MAX_KB	(1ULL << 20)	/* node page cache below 1G */
 #define FREE_MARGIN_KB	(1ULL << 20)	/* node free below high watermark + 1G */
 #define KSWAPD_IDLE_PCT	1.0		/* kswapd CPU %, as atop shows it */
+/* host stall thresholds; overridable with -D to exercise kill on a test host */
+#ifndef IO_FULL_MIN
+#define IO_FULL_MIN	80.0		/* /proc/pressure/io full avg10 */
+#endif
+#ifndef IOWAIT_MIN
+#define IOWAIT_MIN	80.0		/* % of CPU time */
+#endif
+#ifndef SCAN_MIN
+#define SCAN_MIN	600000		/* host pages scanned per second */
+#endif
+#ifndef EFF_MAX
+#define EFF_MAX		10		/* % of scanned pages reclaimed */
+#endif
 
-#define MAX_NODES	64
+#ifndef CGROUP_ROOT
+#define CGROUP_ROOT	"/sys/fs/cgroup/yarn"	/* one directory per container */
+#endif
+#define TOP_N		3		/* culprits listed in a kill verdict */
 #define RUN_DIR		"/run/numaguard"
 #define STATE_FILE	RUN_DIR "/state"
 #define EVENT_LOG	RUN_DIR "/events.log"
@@ -99,6 +120,27 @@ static void read_nodes(void)
 			nodes[nid].high_kb += val * page_kb;
 	}
 	fclose(f);
+}
+
+/* Each node's last pfn + 1, from its zones' start_pfn + spanned. */
+static void read_node_end_pfns(volatile __u64 *end)
+{
+	unsigned long long spanned = 0, start;
+	char line[256];
+	int nid = -1;
+	FILE *f = fopen("/proc/zoneinfo", "r");
+
+	while (f && fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "Node %d, zone", &nid) == 1)
+			continue;
+		if (sscanf(line, " spanned %llu", &spanned) == 1)
+			continue;
+		if (nid >= 0 && nid < MAX_NODES && sscanf(line, " start_pfn: %llu", &start) == 1 &&
+		    start + spanned > end[nid])
+			end[nid] = start + spanned;
+	}
+	if (f)
+		fclose(f);
 }
 
 /* kswapd threads are named "kswapd<nid>"; find their pids once at startup */
@@ -216,7 +258,7 @@ static enum verdict evaluate(const struct host *h, char *who, size_t len)
 	bool host_stalled = h->io_full >= IO_FULL_MIN && h->iowait >= IOWAIT_MIN &&
 			    h->scanned >= SCAN_MIN &&
 			    h->reclaimed * 100 <= h->scanned * EFF_MAX;
-	char warn_nodes[64] = "", kill_nodes[64] = "";
+	char warn_nodes[32] = "", kill_nodes[32] = "";
 
 	for (int i = 0; i < MAX_NODES; i++) {
 		struct node *n = &nodes[i];
@@ -245,22 +287,99 @@ static enum verdict evaluate(const struct host *h, char *who, size_t len)
 	return warn_nodes[0] ? WARN : OK;
 }
 
-/* Write the state file; log the evidence whenever the verdict changes. */
-static void publish(enum verdict v, const char *who, bool enforce, const struct host *h)
+/* Trace allocations once any node is on its way to warn or kill. */
+static bool tracing_wanted(void)
 {
-	static char last[80];
+	for (int i = 0; i < MAX_NODES; i++)
+		if (nodes[i].warn_secs >= WARN_SECS || nodes[i].kill_secs > 0)
+			return true;
+	return false;
+}
+
+static void clear_allocs(int map_fd)
+{
+	struct alloc_key key;
+
+	while (!bpf_map_get_next_key(map_fd, NULL, &key))
+		bpf_map_delete_elem(map_fd, &key);
+}
+
+/* A container's cgroup id is its directory's inode (low 32 bits on 5.4). */
+static void container_name(__u64 cgid, char *name, size_t len)
+{
+	char path[300];
+	struct dirent *d;
+	struct stat st;
+	DIR *dir = opendir(CGROUP_ROOT);
+
+	snprintf(name, len, "cgroup-%llu", (unsigned long long)cgid);
+	while (dir && (d = readdir(dir))) {
+		snprintf(path, sizeof(path), CGROUP_ROOT "/%s", d->d_name);
+		if (d->d_name[0] != '.' && !stat(path, &st) && (__u32)st.st_ino == (__u32)cgid) {
+			snprintf(name, len, "%s", d->d_name);
+			break;
+		}
+	}
+	if (dir)
+		closedir(dir);
+}
+
+/* List the TOP_N containers that allocated most on the nodes in kill. */
+static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_t len)
+{
+	struct { __u64 cgid, pages; } top[TOP_N] = {};
+	struct alloc_key key, *prev = NULL, cur;
+	char name[128];
+	size_t used = 0;
+
+	while (!bpf_map_get_next_key(map_fd, prev, &key)) {
+		__u64 pages = 0;
+
+		cur = key;
+		prev = &cur;
+		if (key.nid >= MAX_NODES || nodes[key.nid].kill_secs < KILL_SECS ||
+		    bpf_map_lookup_elem(map_fd, &key, percpu))
+			continue;
+		for (int c = 0; c < ncpus; c++)
+			pages += percpu[c];
+		for (int t = 0; t < TOP_N; t++) {
+			if (pages <= top[t].pages)
+				continue;
+			memmove(&top[t + 1], &top[t], (TOP_N - t - 1) * sizeof(top[0]));
+			top[t].cgid = key.cgid;
+			top[t].pages = pages;
+			break;
+		}
+	}
+
+	out[0] = '\0';
+	for (int t = 0; t < TOP_N && top[t].pages; t++) {
+		container_name(top[t].cgid, name, sizeof(name));
+		used += snprintf(out + used, len - used, "%s%s:%lluM", used ? "," : "", name,
+				 (unsigned long long)(top[t].pages * page_kb >> 10));
+		if (used >= len)
+			break;
+	}
+}
+
+/* Write the state file; log the evidence whenever the verdict changes. */
+static void publish(enum verdict v, const char *who, const char *culprits, bool enforce,
+		    const struct host *h)
+{
+	static char last[512];
 	enum verdict shown = (v == KILL && !enforce) ? WARN : v;
-	char now[80];
+	char now[512];
 	FILE *f;
 
-	snprintf(now, sizeof(now), "%s %s", verdict_name[v], who);
+	snprintf(now, sizeof(now), "%s %s %s", verdict_name[v], who, culprits);
 	if (!strcmp(now, last))
 		return;
 	snprintf(last, sizeof(last), "%s", now);
 
 	f = fopen(STATE_FILE ".tmp", "w");
 	if (f) {
-		fprintf(f, "state=%s nodes=%s since=%ld\n", verdict_name[shown], who, (long)time(NULL));
+		fprintf(f, "state=%s nodes=%s culprits=%s since=%ld\n", verdict_name[shown], who,
+			shown == KILL ? culprits : "", (long)time(NULL));
 		fclose(f);
 		rename(STATE_FILE ".tmp", STATE_FILE);
 	}
@@ -268,9 +387,9 @@ static void publish(enum verdict v, const char *who, bool enforce, const struct 
 	f = fopen(EVENT_LOG, "a");
 	if (!f)
 		return;
-	fprintf(f, "%ld verdict=%s nodes=%s dry_run=%d io_full=%.0f iowait=%.0f scan=%llu eff=%llu%%",
-		(long)time(NULL), verdict_name[v], who, !enforce, h->io_full, h->iowait, h->scanned,
-		h->scanned ? h->reclaimed * 100 / h->scanned : 100);
+	fprintf(f, "%ld verdict=%s nodes=%s culprits=%s dry_run=%d io_full=%.0f iowait=%.0f scan=%llu eff=%llu%%",
+		(long)time(NULL), verdict_name[v], who, culprits, !enforce, h->io_full, h->iowait,
+		h->scanned, h->scanned ? h->reclaimed * 100 / h->scanned : 100);
 	for (int i = 0; i < MAX_NODES; i++) {
 		const struct node *n = &nodes[i];
 
@@ -285,10 +404,14 @@ static void publish(enum verdict v, const char *who, bool enforce, const struct 
 int main(int argc, char **argv)
 {
 	bool enforce = argc > 1 && !strcmp(argv[1], "--enforce");
+	char who[32] = "", buf[32], culprits[400] = "";
+	struct numaguard_bpf *skel;
+	struct bpf_link *link = NULL;
 	enum verdict v, prev = OK;
-	char who[64] = "", buf[64];
 	time_t kill_since = 0;
+	__u64 *percpu;
 	struct host h;
+	int ncpus, map_fd = -1;
 
 	/* Must keep running while memory thrashes: never page ourselves out. */
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
@@ -296,7 +419,22 @@ int main(int argc, char **argv)
 	mkdir(RUN_DIR, 0755);
 	page_kb = sysconf(_SC_PAGESIZE) / 1024;
 	clk_tck = sysconf(_SC_CLK_TCK);
+	ncpus = libbpf_num_possible_cpus();
+	percpu = calloc(ncpus > 0 ? ncpus : 1, sizeof(*percpu));
 	find_kswapds();
+
+	/* Without BPF the verdicts still work; only the culprits are missing. */
+	skel = numaguard_bpf__open();
+	if (skel) {
+		read_node_end_pfns(skel->rodata->node_end_pfn);
+		if (numaguard_bpf__load(skel)) {
+			fprintf(stderr, "BPF load failed, running without culprits\n");
+			numaguard_bpf__destroy(skel);
+			skel = NULL;
+		} else {
+			map_fd = bpf_map__fd(skel->maps.allocs);
+		}
+	}
 
 	for (;;) {
 		time_t now;
@@ -306,16 +444,33 @@ int main(int argc, char **argv)
 		read_host(&h);
 		v = evaluate(&h, buf, sizeof(buf));
 
+		if (skel && tracing_wanted() && !link) {
+			clear_allocs(map_fd);
+			link = bpf_program__attach(skel->progs.handle_alloc);
+			if (libbpf_get_error(link))
+				link = NULL;
+		}
+
 		now = time(NULL);
-		if (prev == KILL && v != KILL && now - kill_since < KILL_HOLD_SECS)
+		if (prev == KILL && v != KILL && now - kill_since < KILL_HOLD_SECS) {
 			v = KILL;	/* give the NodeManager time to act */
-		else
+		} else {
 			snprintf(who, sizeof(who), "%s", buf);
+			if (v != KILL)
+				culprits[0] = '\0';
+			else if (prev != KILL && link)	/* rank once, when kill starts */
+				find_culprits(map_fd, percpu, ncpus, culprits, sizeof(culprits));
+		}
 		if (v == KILL && prev != KILL)
 			kill_since = now;
 		prev = v;
 
-		publish(v, who, enforce, &h);
+		if (link && v == OK && !tracing_wanted()) {
+			bpf_link__destroy(link);
+			link = NULL;
+		}
+
+		publish(v, who, culprits, enforce, &h);
 		sleep(1);
 	}
 }
