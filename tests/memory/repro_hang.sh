@@ -2,12 +2,13 @@
 # Reproduce the NUMA-node hang and check that numaguard + a mock NodeManager
 # end it. WILL stall the host: test hosts only.
 #
-#   1. Spark-like executors fill node NODE with anonymous memory (allocate, then
-#      idle), leaving ~1.5G of the node for page cache. No memory limit.
-#   2. Shuffle writers keep the node's page cache dirty and readers keep
-#      re-reading a 3G file set it can't hold: reclaim scans hard but must wait
-#      for writeback, and clean pages are read back (IO thrash). The kernel
-#      keeps making progress, so it never OOMs.
+#   1. Spark-like executors of random size (1-6G, random queue) fill the host
+#      with anonymous memory, leaving ROOM_MB for page cache. Nothing is bound to
+#      a node and there is no memory limit: where the pressure lands is up to the
+#      kernel, as in production. An executor the kernel OOM-kills stays dead.
+#   2. Shuffle writers keep the page cache dirty and readers keep re-reading a
+#      3G file set that won't fit: reclaim scans hard but must wait for
+#      writeback, and clean pages are read back (IO thrash).
 #   3. numaguard --enforce (built with CGROUP_ROOT=$ROOT/yarn) judges; the mock NM
 #      kills the first culprit on every new kill verdict, at most 3 times.
 #      GUARD=none skips this step: the baseline run to compare against.
@@ -18,20 +19,18 @@
 # Safety: every process runs under timeout -s KILL, so all memory is freed after
 # MINUTES even if the host is too stalled to reach.
 #
-# Usage: sudo [READERS=300] [ROOM_MB=800] ./repro_hang.sh <numaguard binary|none> [node=1] [minutes=15]
+# Usage: sudo [READERS=300] [ROOM_MB=1500] ./repro_hang.sh <numaguard binary|none> [minutes=15]
 set -euo pipefail
 
 GUARD=$1
-NODE=${2:-1}
-MINUTES=${3:-15}
+MINUTES=${2:-15}
 ROOT=/sys/fs/cgroup/ksb-repro
 YARN=$ROOT/yarn				# executors only, like the NM's cgroup
 WORK=/tmp/ksb-repro
 FILES_GB=3
 READERS=${READERS:-300}
 WRITERS=8
-EXECUTORS=8
-ROOM_MB=${ROOM_MB:-800}			# node memory left for page cache
+ROOM_MB=${ROOM_MB:-1500}		# host memory left for page cache
 PROBE_PID=
 PROBE_LOG=/tmp/ksb-probe-$(basename "$GUARD").log
 QUEUES=(search-data-prod srda-prod szsc adhoc)
@@ -60,7 +59,14 @@ run_in() {
 	( cd "$dir"; echo $BASHPID > "$cg/cgroup.procs"; exec timeout -s KILL "${MINUTES}m" "$@" ) &
 }
 
-meminfo() { awk -v k="$1:" '$3 == k {print int($4 / 1024)}' /sys/devices/system/node/node$NODE/meminfo; }
+meminfo() { awk -v k="$1:" '$1 == k {print int($2 / 1024)}' /proc/meminfo; }
+# "node0 free=..M file=..M dirty=..M node1 ..."
+nodes() {
+	for f in /sys/devices/system/node/node*/meminfo; do
+		awk '$3 == "MemFree:" {f = $4} $3 == "FilePages:" {c = $4} $3 == "Dirty:" {d = $4}
+			END {printf "node%s free=%dM file=%dM dirty=%dM ", $2, f / 1024, c / 1024, d / 1024}' "$f"
+	done
+}
 
 mkdir -p "$WORK/files"
 log "writing ${FILES_GB}G file set"
@@ -71,22 +77,25 @@ dd if=/dev/urandom of="$WORK/probe" bs=1M count=1024 status=none
 sync; echo 1 > /proc/sys/vm/drop_caches
 
 mkdir "$ROOT"
-echo "+cpuset +memory" > "$ROOT/cgroup.subtree_control"
-cat /sys/devices/system/cpu/online > "$ROOT/cpuset.cpus"
-echo "$NODE" > "$ROOT/cpuset.mems"
+echo "+memory" > "$ROOT/cgroup.subtree_control"
 mkdir "$YARN"
-echo "+cpuset +memory" > "$YARN/cgroup.subtree_control"
+echo "+memory" > "$YARN/cgroup.subtree_control"
 
-# 1. executors: everything reclaimable on the node except ROOM_MB
-fill_mb=$(( $(meminfo MemFree) + $(meminfo FilePages) - ROOM_MB ))
-log "node$NODE: filling ${fill_mb}MB with $EXECUTORS executors"
-for id in $(seq $EXECUTORS); do
+# 1. executors: everything reclaimable on the host except ROOM_MB
+left=$(( $(meminfo MemFree) + $(meminfo Cached) - ROOM_MB ))
+log "filling ${left}MB with random executors"
+id=0
+while [ $left -gt 0 ]; do
+	id=$((id + 1)) mb=$(( (1 + RANDOM % 6) * 1024 ))
+	[ $mb -le $left ] || mb=$left
 	queue=${QUEUES[RANDOM % ${#QUEUES[@]}]}
 	dir=$WORK/exec_$id
 	mkdir -p "$dir/__spark_conf__"
 	echo "spark.yarn.queue=$queue" > "$dir/__spark_conf__/__spark_conf__.properties"
-	run_in "$YARN/exec_$id" "$dir" stress-ng --vm 1 --vm-bytes "$((fill_mb / EXECUTORS))M" --vm-hang 0 -q
-	log "exec_$id $((fill_mb / EXECUTORS))MB queue=$queue"
+	run_in "$YARN/exec_$id" "$dir" stress-ng --vm 1 --vm-bytes "${mb}M" --vm-hang 0 --oomable -q
+	log "exec_$id ${mb}MB queue=$queue"
+	left=$((left - mb))
+	sleep $((RANDOM % 3))
 done
 sleep 60
 
@@ -123,7 +132,7 @@ while [ $SECONDS -lt $end ]; do
 		last=$victim kills=$((kills + 1))
 	fi
 	if [ $SECONDS -ge $next_log ]; then
-		log "io $(grep full /proc/pressure/io | cut -d' ' -f2) D=$(grep -l '^State:.D' /proc/[0-9]*/status 2>/dev/null | wc -l) probe=$(tail -1 "$PROBE_LOG" | cut -d' ' -f2)ms node$NODE free=$(meminfo MemFree)M file=$(meminfo FilePages)M dirty=$(meminfo Dirty)M ${state%% nodes*}"
+		log "io $(grep full /proc/pressure/io | cut -d' ' -f2) D=$(grep -l '^State:.D' /proc/[0-9]*/status 2>/dev/null | wc -l) probe=$(tail -1 "$PROBE_LOG" | cut -d' ' -f2)ms $(nodes)${state%% culprits*}"
 		next_log=$((SECONDS + 30))
 	fi
 done
