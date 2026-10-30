@@ -9,8 +9,9 @@
 #   2. Shuffle writers keep the page cache dirty and readers keep re-reading a
 #      3G file set that won't fit: reclaim scans hard but must wait for
 #      writeback, and clean pages are read back (IO thrash).
-#   3. numaguard --enforce (built with CGROUP_ROOT=$ROOT/yarn) judges; the mock NM
-#      kills the first culprit on every new kill verdict, at most 3 times.
+#   3. numaguard judges with RULES (default: the shipped numa.rules), with scope
+#      set to $ROOT/yarn and mode to enforce; the mock NM kills the first culprit
+#      of every new kill verdict, at most 3 times.
 #      GUARD=none skips this step: the baseline run to compare against.
 #
 # A probe in the root cgroup does a 4K O_DIRECT read every 5s, as any process on
@@ -19,7 +20,7 @@
 # Safety: every process runs under timeout -s KILL, so all memory is freed after
 # MINUTES even if the host is too stalled to reach.
 #
-# Usage: sudo [READERS=300] [ROOM_MB=1500] ./repro_hang.sh <numaguard binary|none> [minutes=15]
+# Usage: sudo [READERS=300] [ROOM_MB=1500] [RULES=file] ./repro_hang.sh <numaguard binary|none> [minutes=15]
 set -euo pipefail
 
 GUARD=$1
@@ -33,6 +34,7 @@ WRITERS=8
 ROOM_MB=${ROOM_MB:-1500}		# host memory left for page cache
 PROBE_PID=
 PROBE_LOG=/tmp/ksb-probe-$(basename "$GUARD").log
+RULES=${RULES:-$(dirname "$0")/../../tools/memory/numaguard/rules.d/numa.rules}
 QUEUES=(search-data-prod srda-prod szsc adhoc)
 
 log() { echo "$(date +%T) $*"; }
@@ -119,7 +121,9 @@ PROBE_PID=$!
 
 # 3. numaguard and the mock NodeManager
 rm -f /run/numaguard/state /run/numaguard/events.log
-[ "$GUARD" = none ] || setsid "$GUARD" --enforce < /dev/null > /dev/null 2>&1 &
+mkdir -p "$WORK/rules"
+sed -e "s|^scope.*|scope $YARN|" -e "s|^mode.*|mode enforce|" "$RULES" > "$WORK/rules/test.rules"
+[ "$GUARD" = none ] || setsid "$GUARD" "$WORK/rules" < /dev/null > /tmp/ksb-guard.log 2>&1 &
 kills=0 last= next_log=0
 end=$((SECONDS + MINUTES * 60))
 while [ $SECONDS -lt $end ]; do

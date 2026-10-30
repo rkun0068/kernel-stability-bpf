@@ -60,6 +60,8 @@ $(OUTPUT)/%: $(OUTPUT)/%.o $(COMMON_OBJS)
 install-numaguard: numaguard
 	install -m 0755 $(OUTPUT)/numaguard /usr/local/sbin/numaguard
 	install -m 0644 $(numaguard_DIR)/numaguard.service /etc/systemd/system/numaguard.service
+	install -d /etc/numaguard/rules.d
+	install -m 0644 -b $(numaguard_DIR)/rules.d/*.rules /etc/numaguard/rules.d/
 	systemctl daemon-reload
 
 clean:
