@@ -4,9 +4,10 @@
 #
 #   1. Spark-like executors fill node NODE with anonymous memory (allocate, then
 #      idle), leaving ~1.5G of the node for page cache. No memory limit.
-#   2. Readers keep re-reading a 3G file set on that node: the page cache can't
-#      hold it, so pages are reclaimed and read back forever (IO thrash). The
-#      kernel keeps making progress, so it never OOMs.
+#   2. Shuffle writers keep the node's page cache dirty and readers keep
+#      re-reading a 3G file set it can't hold: reclaim scans hard but must wait
+#      for writeback, and clean pages are read back (IO thrash). The kernel
+#      keeps making progress, so it never OOMs.
 #   3. numaguard --enforce (built with CGROUP_ROOT=$ROOT/yarn) judges; the mock NM
 #      kills the first culprit on every new kill verdict, at most 3 times.
 #
@@ -24,6 +25,7 @@ YARN=$ROOT/yarn				# executors only, like the NM's cgroup
 WORK=/tmp/ksb-repro
 FILES_GB=3
 READERS=48
+WRITERS=8
 EXECUTORS=8
 QUEUES=(search-data-prod srda-prod szsc adhoc)
 
@@ -32,13 +34,11 @@ log() { echo "$(date +%T) $*"; }
 cleanup() {
 	log "cleaning up"
 	pkill -f "$GUARD" || true
-	for cg in "$YARN"/*/ "$ROOT"/readers/ "$YARN"/; do
-		[ -d "$cg" ] || continue
-		xargs -r kill -9 < "$cg/cgroup.procs" 2>/dev/null || true
-		while grep -q . "$cg/cgroup.procs"; do sleep 0.2; done
-		rmdir "$cg"
+	for procs in $(find "$ROOT" -name cgroup.procs 2>/dev/null); do
+		xargs -r kill -9 < "$procs" 2>/dev/null || true
 	done
-	rmdir "$ROOT" 2>/dev/null || true
+	sleep 2
+	find "$ROOT" -depth -type d -exec rmdir {} + 2>/dev/null || true
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -79,8 +79,10 @@ for id in $(seq $EXECUTORS); do
 done
 sleep 60
 
-# 2. readers: a working set the remaining page cache can't hold
-log "starting $READERS readers"
+# 2. shuffle writers (dirty pages) and readers (a working set that won't fit)
+log "starting $WRITERS writers, $READERS readers"
+mkdir -p "$WORK/shuffle"
+run_in "$ROOT/writers" "$WORK" stress-ng --hdd "$WRITERS" --hdd-bytes 2G --temp-path "$WORK/shuffle" -q
 for r in $(seq $READERS); do
 	run_in "$ROOT/readers" "$WORK" sh -c "while :; do cat files/* > /dev/null; done"
 done
@@ -100,7 +102,7 @@ while [ $SECONDS -lt $end ]; do
 		last=$victim kills=$((kills + 1))
 	fi
 	if [ $SECONDS -ge $next_log ]; then
-		log "io $(grep full /proc/pressure/io | cut -d' ' -f2) node$NODE free=$(meminfo MemFree)M file=$(meminfo FilePages)M ${state%% nodes*}"
+		log "io $(grep full /proc/pressure/io | cut -d' ' -f2) node$NODE free=$(meminfo MemFree)M file=$(meminfo FilePages)M dirty=$(meminfo Dirty)M ${state%% nodes*}"
 		next_log=$((SECONDS + 30))
 	fi
 done
