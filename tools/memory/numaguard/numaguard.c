@@ -36,10 +36,14 @@
 #define WARN_SECS	600
 #define KILL_SECS	60
 #define KILL_HOLD_SECS	300		/* keep a kill verdict at least this long */
-#define FILE_MAX_KB	(1ULL << 20)	/* node page cache below 1G */
-#define FREE_MARGIN_KB	(1ULL << 20)	/* node free below high watermark + 1G */
 #define KSWAPD_IDLE_PCT	1.0		/* kswapd CPU %, as atop shows it */
-/* host stall thresholds; overridable with -D to exercise kill on a test host */
+/* kill thresholds; overridable with -D to exercise kill on a test host */
+#ifndef FILE_MAX_KB
+#define FILE_MAX_KB	(1ULL << 20)	/* node page cache below 1G */
+#endif
+#ifndef FREE_MARGIN_KB
+#define FREE_MARGIN_KB	(1ULL << 20)	/* node free below high watermark + 1G */
+#endif
 #ifndef IO_FULL_MIN
 #define IO_FULL_MIN	80.0		/* /proc/pressure/io full avg10 */
 #endif
