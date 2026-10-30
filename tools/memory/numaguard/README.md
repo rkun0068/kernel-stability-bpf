@@ -47,10 +47,10 @@ and has been idle since is not a candidate.
 
 Containers are not bound to nodes, and 5.4 has no `memory.numa_stat`, so the
 only cheap way to know who fills a node is to watch page allocations:
-`kmem:mm_page_alloc` → (cgroup id, node from pfn) → pages, in a per-CPU hash.
+`kmem:mm_page_alloc` → key `cgroup id << 8 | node` (node from pfn) → pages.
 Page allocation is a hot path and the hosts run without BPF JIT, so the program
-is attached only while a node is in `warn` or is counting towards `kill`, and
-detached when everything is `ok` again. If BPF fails to load, the verdicts still
+is loaded only while a node is in `warn` or is counting towards `kill`, and
+unloaded when everything is `ok` again. If BPF fails to load, the verdicts still
 work and `culprits` stays empty.
 
 Counts are gross allocations (frees are not subtracted), which is why they
