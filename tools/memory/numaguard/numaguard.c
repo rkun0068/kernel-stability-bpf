@@ -63,7 +63,7 @@
 #define TOP_N		3		/* culprits listed in a kill verdict */
 #define SHARE_MIN_PCT	5		/* culprit: holds >= 5% of the thrashing node */
 #define HIGH_PRIO_SUFFIX "-prod"	/* YARN queues killed last */
-#define MAX_CONTAINERS	512
+#define MAX_CONTAINERS	256
 #define RUN_DIR		"/run/numaguard"
 #define STATE_FILE	RUN_DIR "/state"
 #define EVENT_LOG	RUN_DIR "/events.log"
@@ -315,7 +315,7 @@ static void clear_allocs(int map_fd)
 
 struct container {
 	__u32 ino;			/* == cgroup id (low 32 bits on 5.4) */
-	char name[200];
+	char name[256];
 	char queue[64];			/* spark.yarn.queue, "-" if unknown */
 	bool high_prio;
 	unsigned long long mem_kb;	/* memory.current */

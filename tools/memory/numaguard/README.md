@@ -24,17 +24,24 @@ The node whose kswapd stopped still has page cache, so it does not reach `kill`.
 `/run/numaguard/state` (tmpfs, replaced atomically):
 
 ```
-state=kill nodes=1 culprits=container_e2041_..._000826:10100M,container_..._001015:22800M since=1761000000
+state=kill nodes=1 culprits=container_..._000826(queue=adhoc,low,node=9800M),container_..._001015(queue=szsc-prod,high,node=21000M) since=1761000000
 ```
 
-`culprits` are up to 3 containers under `/sys/fs/cgroup/yarn`, with their
-`memory.current`. Candidates are the containers that allocated at least 10% as
-many pages on the thrashing node as the top allocator, since tracing started;
-they are ranked by `memory.current`, i.e. by what killing them would free.
-Allocations alone would rank page-cache churn (shuffle writes) first. Ranked
-once, when the kill verdict starts; NM can apply its own priority on top.
-A container that filled its memory before tracing started and has been idle
-since is not a candidate.
+`culprits` are up to 3 containers under `/sys/fs/cgroup/yarn`, in kill order:
+
+1. **On the thrashing node**: it allocated pages there since tracing started.
+2. **Large share of the node**: it holds ≥ 5% of the node's memory, estimated
+   as `memory.current` × (its pages allocated on the node / all its pages).
+   5.4 has no per-node memory per cgroup; using `memory.current` keeps
+   page-cache churn (shuffle writes) from looking big.
+3. **Low priority first**, then the most memory on the node. Priority comes
+   from `spark.yarn.queue` in the container's
+   `__spark_conf__/__spark_conf__.properties` (only that key is read):
+   queues ending in `-prod` are high priority.
+
+Each entry reads `name(queue=...,low|high,node=<MB>)`. Ranked once, when the
+kill verdict starts. A container that filled its memory before tracing started
+and has been idle since is not a candidate.
 
 ## Finding culprits (BPF)
 
@@ -47,7 +54,7 @@ detached when everything is `ok` again. If BPF fails to load, the verdicts still
 work and `culprits` stays empty.
 
 Counts are gross allocations (frees are not subtracted), which is why they
-only select candidates and `memory.current` does the ranking.
+only split a container's `memory.current` across nodes.
 
 `/run/numaguard/events.log`: one line with all metrics each time the verdict changes.
 
