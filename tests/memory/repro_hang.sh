@@ -37,8 +37,10 @@ cleanup() {
 	for procs in $(find "$ROOT" -name cgroup.procs 2>/dev/null); do
 		xargs -r kill -9 < "$procs" 2>/dev/null || true
 	done
-	sleep 2
-	find "$ROOT" -depth -type d -exec rmdir {} + 2>/dev/null || true
+	for cg in $(find "$ROOT" -depth -type d 2>/dev/null); do
+		while grep -q . "$cg/cgroup.procs"; do sleep 0.2; done
+		rmdir "$cg"
+	done
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
