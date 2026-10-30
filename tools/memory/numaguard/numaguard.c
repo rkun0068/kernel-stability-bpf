@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * numaguard: detect the NUMA-node thrashing that precedes a host hang and
- * publish a verdict for the NodeManager in /run/numaguard/state.
+ * tell the NodeManager which node is thrashing and which containers to kill.
+ * Output: /run/numaguard/state.
  *
- *   warn: a node's kswapd is idle while the node's free memory stays below
- *         its high watermark, for 10 minutes.
- *   kill: the host is stalled on IO (IO PSI full and iowait), the host scans
- *         hard but reclaims almost nothing, and a node has no page cache left
- *         and free memory near its high watermark, for 60 seconds.
+ *   warn: a node's kswapd is idle while its free memory stays below the high
+ *         watermark, for 10 minutes.
+ *   kill: the host is stalled on IO (IO PSI full, iowait) and scans hard but
+ *         reclaims almost nothing, and a node has no page cache left and free
+ *         memory near its high watermark, for 60 seconds.
  *
- * The verdict itself comes from procfs/sysfs, the same sources as sar and
- * atop that the thresholds come from. To name the culprits, a BPF program
- * counts pages allocated per (container, node); it is attached only while a
- * node is heading for a hang, and a kill verdict lists the containers that
- * allocated most on the thrashing node.
- *
- * Without --enforce (dry run) a kill verdict is only logged; the state file
- * says warn.
+ * Verdicts come from procfs, the sources (sar, atop) the thresholds came from.
+ * From the first sign of trouble until all is ok again, a BPF program counts
+ * pages allocated per (container, node); a kill verdict uses it to name the
+ * containers to kill. Without --enforce a kill is only logged (dry run).
  */
 #include <dirent.h>
 #include <stdbool.h>
@@ -37,36 +34,22 @@
 #define KILL_SECS	60
 #define KILL_HOLD_SECS	300		/* keep a kill verdict at least this long */
 #define KSWAPD_IDLE_PCT	1.0		/* kswapd CPU %, as atop shows it */
-/* kill thresholds; overridable with -D to exercise kill on a test host */
-#ifndef FILE_MAX_KB
-#define FILE_MAX_KB	(1ULL << 20)	/* node page cache below 1G */
-#endif
-#ifndef FREE_MARGIN_KB
-#define FREE_MARGIN_KB	(1ULL << 20)	/* node free below high watermark + 1G */
-#endif
-#ifndef IO_FULL_MIN
 #define IO_FULL_MIN	80.0		/* /proc/pressure/io full avg10 */
-#endif
-#ifndef IOWAIT_MIN
 #define IOWAIT_MIN	80.0		/* % of CPU time */
-#endif
-#ifndef SCAN_MIN
 #define SCAN_MIN	600000		/* host pages scanned per second */
-#endif
-#ifndef EFF_MAX
 #define EFF_MAX		10		/* % of scanned pages reclaimed */
-#endif
+#define FILE_MAX_KB	(1ULL << 20)	/* node page cache below 1G */
+#define FREE_MARGIN_KB	(1ULL << 20)	/* node free below high watermark + 1G */
 
-#ifndef CGROUP_ROOT
+/* Culprits */
 #define CGROUP_ROOT	"/sys/fs/cgroup/yarn"	/* one directory per container */
-#endif
-#define TOP_N		3		/* culprits listed in a kill verdict */
-#define SHARE_MIN_PCT	5		/* culprit: holds >= 5% of the thrashing node */
+#define SHARE_MIN_PCT	5		/* holds >= 5% of the thrashing node */
 #define HIGH_PRIO_SUFFIX "-prod"	/* YARN queues killed last */
+#define TOP_N		3
 #define MAX_CONTAINERS	256
-#define RUN_DIR		"/run/numaguard"
-#define STATE_FILE	RUN_DIR "/state"
-#define EVENT_LOG	RUN_DIR "/events.log"
+
+#define STATE_FILE	"/run/numaguard/state"
+#define EVENT_LOG	"/run/numaguard/events.log"
 
 enum verdict { OK, WARN, KILL };
 static const char *verdict_name[] = { "ok", "warn", "kill" };
@@ -75,19 +58,40 @@ struct node {
 	bool online;
 	unsigned long long total_kb, free_kb, file_kb, high_kb;
 	int kswapd_pid;
-	unsigned long long kswapd_ticks;	/* utime + stime, cumulative */
-	double kswapd_pct;			/* CPU % over the last second */
+	unsigned long long kswapd_ticks;	/* utime + stime */
+	double kswapd_pct;			/* over the last second */
 	int warn_secs, kill_secs;		/* how long each rule held */
 };
 
-/* host-wide, over the last second */
 struct host {
 	double io_full, iowait;
-	unsigned long long scanned, reclaimed;
+	unsigned long long scanned, reclaimed;	/* pages, last second */
+};
+
+struct container {
+	char name[256];
+	char queue[64];
+	bool high_prio;
+	unsigned long long mem_kb;		/* memory.current */
+	unsigned long long node_pages;		/* allocated on the kill nodes */
+	unsigned long long all_pages;		/* allocated anywhere */
+	unsigned long long node_kb;		/* estimated memory on the kill nodes */
 };
 
 static struct node nodes[MAX_NODES];
+static struct container containers[MAX_CONTAINERS];
+static struct numaguard_bpf *skel;		/* loaded only while tracing */
 static long page_kb, clk_tck;
+
+static bool read_ull(const char *path, unsigned long long *val)
+{
+	FILE *f = fopen(path, "r");
+	bool ok = f && fscanf(f, "%llu", val) == 1;
+
+	if (f)
+		fclose(f);
+	return ok;
+}
 
 static void read_nodes(void)
 {
@@ -103,9 +107,7 @@ static void read_nodes(void)
 		f = fopen(path, "r");
 		n->online = f != NULL;
 		n->high_kb = 0;
-		if (!f)
-			continue;
-		while (fgets(line, sizeof(line), f)) {
+		while (f && fgets(line, sizeof(line), f)) {
 			if (sscanf(line, "Node %*d %31[^:]: %llu", key, &val) != 2)
 				continue;
 			if (!strcmp(key, "MemTotal"))
@@ -115,38 +117,17 @@ static void read_nodes(void)
 			else if (!strcmp(key, "FilePages"))
 				n->file_kb = val;
 		}
-		fclose(f);
+		if (f)
+			fclose(f);
 	}
 
 	/* a node's high watermark is the sum over its zones */
 	f = fopen("/proc/zoneinfo", "r");
-	if (!f)
-		return;
-	while (fgets(line, sizeof(line), f)) {
+	while (f && fgets(line, sizeof(line), f)) {
 		if (sscanf(line, "Node %d, zone", &nid) == 1)
 			continue;
 		if (nid >= 0 && nid < MAX_NODES && sscanf(line, " high %llu", &val) == 1)
 			nodes[nid].high_kb += val * page_kb;
-	}
-	fclose(f);
-}
-
-/* Each node's last pfn + 1, from its zones' start_pfn + spanned. */
-static void read_node_end_pfns(volatile __u64 *end)
-{
-	unsigned long long spanned = 0, start;
-	char line[256];
-	int nid = -1;
-	FILE *f = fopen("/proc/zoneinfo", "r");
-
-	while (f && fgets(line, sizeof(line), f)) {
-		if (sscanf(line, "Node %d, zone", &nid) == 1)
-			continue;
-		if (sscanf(line, " spanned %llu", &spanned) == 1)
-			continue;
-		if (nid >= 0 && nid < MAX_NODES && sscanf(line, " start_pfn: %llu", &start) == 1 &&
-		    start + spanned > end[nid])
-			end[nid] = start + spanned;
 	}
 	if (f)
 		fclose(f);
@@ -182,7 +163,7 @@ static void read_kswapds(void)
 
 	for (int i = 0; i < MAX_NODES; i++) {
 		struct node *n = &nodes[i];
-		unsigned long long utime, stime, ticks;
+		unsigned long long utime, stime;
 		FILE *f;
 
 		if (!n->kswapd_pid)
@@ -195,10 +176,9 @@ static void read_kswapds(void)
 		if (fgets(buf, sizeof(buf), f) && (p = strrchr(buf, ')')) &&
 		    sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
 			   &utime, &stime) == 2) {
-			ticks = utime + stime;
 			if (n->kswapd_ticks)
-				n->kswapd_pct = 100.0 * (ticks - n->kswapd_ticks) / clk_tck;
-			n->kswapd_ticks = ticks;
+				n->kswapd_pct = 100.0 * (utime + stime - n->kswapd_ticks) / clk_tck;
+			n->kswapd_ticks = utime + stime;
 		}
 		fclose(f);
 	}
@@ -213,45 +193,42 @@ static void read_host(struct host *h)
 
 	h->io_full = 0;
 	f = fopen("/proc/pressure/io", "r");
-	if (f) {
-		while (fgets(line, sizeof(line), f))
-			if (sscanf(line, "full avg10=%lf", &h->io_full) == 1)
-				break;
+	while (f && fgets(line, sizeof(line), f))
+		if (sscanf(line, "full avg10=%lf", &h->io_full) == 1)
+			break;
+	if (f)
 		fclose(f);
-	}
 
 	h->iowait = 0;
 	f = fopen("/proc/stat", "r");
-	if (f) {
-		if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-			   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) {
-			for (int i = 0; i < 8; i++)
-				total += v[i];
-			if (prev_total && total > prev_total)
-				h->iowait = 100.0 * (v[4] - prev_wait) / (total - prev_total);
-			prev_wait = v[4];
-			prev_total = total;
-		}
-		fclose(f);
+	if (f && fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+			&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) {
+		for (int i = 0; i < 8; i++)
+			total += v[i];
+		if (prev_total && total > prev_total)
+			h->iowait = 100.0 * (v[4] - prev_wait) / (total - prev_total);
+		prev_wait = v[4];
+		prev_total = total;
 	}
+	if (f)
+		fclose(f);
 
-	/* sar -B's pgscank+pgscand and pgsteal */
+	/* sar -B's pgscank + pgscand and pgsteal */
 	f = fopen("/proc/vmstat", "r");
-	if (f) {
-		while (fgets(line, sizeof(line), f)) {
-			if (sscanf(line, "%63s %llu", key, &val) != 2)
-				continue;
-			if (!strcmp(key, "pgscan_kswapd") || !strcmp(key, "pgscan_direct"))
-				scan += val;
-			else if (!strcmp(key, "pgsteal_kswapd") || !strcmp(key, "pgsteal_direct"))
-				steal += val;
-		}
-		fclose(f);
-		h->scanned = prev_scan ? scan - prev_scan : 0;
-		h->reclaimed = prev_steal ? steal - prev_steal : 0;
-		prev_scan = scan;
-		prev_steal = steal;
+	while (f && fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "%63s %llu", key, &val) != 2)
+			continue;
+		if (!strcmp(key, "pgscan_kswapd") || !strcmp(key, "pgscan_direct"))
+			scan += val;
+		else if (!strcmp(key, "pgsteal_kswapd") || !strcmp(key, "pgsteal_direct"))
+			steal += val;
 	}
+	if (f)
+		fclose(f);
+	h->scanned = prev_scan ? scan - prev_scan : 0;
+	h->reclaimed = prev_steal ? steal - prev_steal : 0;
+	prev_scan = scan;
+	prev_steal = steal;
 }
 
 static void append_node(char *list, size_t len, int nid)
@@ -261,12 +238,11 @@ static void append_node(char *list, size_t len, int nid)
 	snprintf(list + used, len - used, "%s%d", used ? "," : "", nid);
 }
 
-/* Advance each node's rule timers; return the verdict and the nodes behind it. */
+/* Advance each node's rule timers; return the verdict and its nodes. */
 static enum verdict evaluate(const struct host *h, char *who, size_t len)
 {
 	bool host_stalled = h->io_full >= IO_FULL_MIN && h->iowait >= IOWAIT_MIN &&
-			    h->scanned >= SCAN_MIN &&
-			    h->reclaimed * 100 <= h->scanned * EFF_MAX;
+			    h->scanned >= SCAN_MIN && h->reclaimed * 100 <= h->scanned * EFF_MAX;
 	char warn_nodes[32] = "", kill_nodes[32] = "";
 
 	for (int i = 0; i < MAX_NODES; i++) {
@@ -275,10 +251,8 @@ static enum verdict evaluate(const struct host *h, char *who, size_t len)
 
 		if (!n->online)
 			continue;
-
 		kswapd_stopped = n->kswapd_pct < KSWAPD_IDLE_PCT && n->free_kb < n->high_kb;
 		thrashing = n->file_kb < FILE_MAX_KB && n->free_kb < n->high_kb + FREE_MARGIN_KB;
-
 		n->warn_secs = kswapd_stopped ? n->warn_secs + 1 : 0;
 		n->kill_secs = host_stalled && thrashing ? n->kill_secs + 1 : 0;
 
@@ -288,15 +262,11 @@ static enum verdict evaluate(const struct host *h, char *who, size_t len)
 			append_node(warn_nodes, sizeof(warn_nodes), i);
 	}
 
-	if (kill_nodes[0]) {
-		snprintf(who, len, "%s", kill_nodes);
-		return KILL;
-	}
-	snprintf(who, len, "%s", warn_nodes);
-	return warn_nodes[0] ? WARN : OK;
+	snprintf(who, len, "%s", kill_nodes[0] ? kill_nodes : warn_nodes);
+	return kill_nodes[0] ? KILL : warn_nodes[0] ? WARN : OK;
 }
 
-/* Trace allocations once any node is on its way to warn or kill. */
+/* Count allocations once any node is heading for warn or kill. */
 static bool tracing_wanted(void)
 {
 	for (int i = 0; i < MAX_NODES; i++)
@@ -305,38 +275,44 @@ static bool tracing_wanted(void)
 	return false;
 }
 
-static void clear_allocs(int map_fd)
+static void start_tracing(void)
 {
-	struct alloc_key key;
+	unsigned long long spanned = 0, start;
+	char line[256];
+	int nid = -1;
+	FILE *f;
 
-	while (!bpf_map_get_next_key(map_fd, NULL, &key))
-		bpf_map_delete_elem(map_fd, &key);
-}
+	skel = numaguard_bpf__open();
+	if (!skel)
+		return;
 
-struct container {
-	__u32 ino;			/* == cgroup id (low 32 bits on 5.4) */
-	char name[256];
-	char queue[64];			/* spark.yarn.queue, "-" if unknown */
-	bool high_prio;
-	unsigned long long mem_kb;	/* memory.current */
-	unsigned long long node_pages;	/* allocated on the nodes in kill */
-	unsigned long long all_pages;	/* allocated on all nodes */
-	unsigned long long node_kb;	/* estimated memory held on the nodes in kill */
-};
-
-static struct container containers[MAX_CONTAINERS];
-
-static bool read_ull(const char *path, unsigned long long *val)
-{
-	FILE *f = fopen(path, "r");
-	bool ok = f && fscanf(f, "%llu", val) == 1;
-
+	/* each node's end pfn: max over its zones of start_pfn + spanned */
+	f = fopen("/proc/zoneinfo", "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "Node %d, zone", &nid) == 1)
+			continue;
+		if (sscanf(line, " spanned %llu", &spanned) == 1)
+			continue;
+		if (nid >= 0 && nid < MAX_NODES && sscanf(line, " start_pfn: %llu", &start) == 1 &&
+		    start + spanned > skel->rodata->node_end_pfn[nid])
+			skel->rodata->node_end_pfn[nid] = start + spanned;
+	}
 	if (f)
 		fclose(f);
-	return ok;
+
+	if (numaguard_bpf__load(skel) || numaguard_bpf__attach(skel)) {
+		numaguard_bpf__destroy(skel);
+		skel = NULL;
+	}
 }
 
-/* The YARN queue, from the Spark conf in the working dir of the container's first process. */
+static void stop_tracing(void)
+{
+	numaguard_bpf__destroy(skel);
+	skel = NULL;
+}
+
+/* Read spark.yarn.queue (only that key: the file may hold credentials). */
 static void read_queue(const char *cgroup, char *queue, size_t len)
 {
 	char path[512], cwd[400], line[512];
@@ -355,44 +331,11 @@ static void read_queue(const char *cgroup, char *queue, size_t len)
 	cwd[n] = '\0';
 	snprintf(path, sizeof(path), "%s/__spark_conf__/__spark_conf__.properties", cwd);
 	f = fopen(path, "r");
-	if (!f)
-		return;
-	while (fgets(line, sizeof(line), f))	/* only this key: the file may hold credentials */
+	while (f && fgets(line, sizeof(line), f))
 		if (sscanf(line, "spark.yarn.queue=%63s", queue) == 1)
 			break;
-	fclose(f);
-}
-
-/* Snapshot the containers under CGROUP_ROOT; returns how many. */
-static int list_containers(void)
-{
-	char dir_path[300], path[320];
-	struct dirent *d;
-	struct stat st;
-	DIR *dir = opendir(CGROUP_ROOT);
-	int n = 0;
-
-	while (dir && n < MAX_CONTAINERS && (d = readdir(dir))) {
-		struct container *c = &containers[n];
-		size_t qlen;
-
-		snprintf(dir_path, sizeof(dir_path), CGROUP_ROOT "/%s", d->d_name);
-		snprintf(path, sizeof(path), "%s/memory.current", dir_path);
-		memset(c, 0, sizeof(*c));
-		if (d->d_name[0] == '.' || stat(dir_path, &st) || !read_ull(path, &c->mem_kb))
-			continue;
-		c->mem_kb >>= 10;
-		c->ino = st.st_ino;
-		snprintf(c->name, sizeof(c->name), "%s", d->d_name);
-		read_queue(dir_path, c->queue, sizeof(c->queue));
-		qlen = strlen(c->queue);
-		c->high_prio = qlen >= strlen(HIGH_PRIO_SUFFIX) &&
-			       !strcmp(c->queue + qlen - strlen(HIGH_PRIO_SUFFIX), HIGH_PRIO_SUFFIX);
-		n++;
-	}
-	if (dir)
-		closedir(dir);
-	return n;
+	if (f)
+		fclose(f);
 }
 
 /* Kill order: low priority first, then the most memory on the thrashing node. */
@@ -403,59 +346,84 @@ static bool kill_before(const struct container *a, const struct container *b)
 	return a->node_kb > b->node_kb;
 }
 
-/*
- * Name the containers to kill on the nodes in kill:
- *   1. on the node: it allocated pages there since tracing started (BPF);
- *   2. a large share: it holds >= SHARE_MIN_PCT of the node, estimated as
- *      memory.current x its share of allocations made on that node (5.4 has
- *      no per-node memory per cgroup; memory.current keeps page-cache churn
- *      such as shuffle writes from looking big);
- *   3. low priority first, then by memory held on the node.
- */
-static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_t len)
+/* Read one container's queue, memory.current and allocations from the map. */
+static void read_container(struct container *c, const char *name, __u32 cgid, int map_fd)
 {
-	struct alloc_key key, *prev = NULL, cur;
+	unsigned long long key, *prev = NULL, cur, pages;
+	char path[320];
+	size_t q;
+
+	memset(c, 0, sizeof(*c));
+	snprintf(c->name, sizeof(c->name), "%s", name);
+
+	snprintf(path, sizeof(path), CGROUP_ROOT "/%s", name);
+	read_queue(path, c->queue, sizeof(c->queue));
+	q = strlen(c->queue);
+	c->high_prio = q >= strlen(HIGH_PRIO_SUFFIX) &&
+		       !strcmp(c->queue + q - strlen(HIGH_PRIO_SUFFIX), HIGH_PRIO_SUFFIX);
+
+	snprintf(path, sizeof(path), CGROUP_ROOT "/%s/memory.current", name);
+	read_ull(path, &c->mem_kb);
+	c->mem_kb >>= 10;
+
+	/* map keys are (cgroup id << 8 | node); 5.4 cgroup ids fit in 32 bits */
+	while (!bpf_map_get_next_key(map_fd, prev, &key)) {
+		cur = key;
+		prev = &cur;
+		if ((__u32)(key >> 8) != cgid || bpf_map_lookup_elem(map_fd, &key, &pages))
+			continue;
+		c->all_pages += pages;
+		if (nodes[key & 0xff].kill_secs >= KILL_SECS)
+			c->node_pages += pages;
+	}
+}
+
+/*
+ * Name the containers to kill:
+ *   1. on the thrashing node: it allocated pages there (BPF);
+ *   2. a large share of it: >= SHARE_MIN_PCT, estimated as memory.current x
+ *      its share of allocations made there (5.4 has no per-node memory per
+ *      cgroup; memory.current keeps page-cache churn from looking big);
+ *   3. low priority first, then the most memory on the node.
+ */
+static void find_culprits(char *out, size_t len)
+{
 	struct container *top[TOP_N] = {};
-	unsigned long long node_total_kb = 0;
-	int n = list_containers();
+	unsigned long long kill_kb = 0;
+	char path[320];
+	struct dirent *d;
+	struct stat st;
+	DIR *dir = opendir(CGROUP_ROOT);
+	int n = 0;
 	size_t used = 0;
 
 	for (int i = 0; i < MAX_NODES; i++)
 		if (nodes[i].kill_secs >= KILL_SECS)
-			node_total_kb += nodes[i].total_kb;
+			kill_kb += nodes[i].total_kb;
 
-	while (!bpf_map_get_next_key(map_fd, prev, &key)) {
-		unsigned long long pages = 0;
-
-		cur = key;
-		prev = &cur;
-		if (key.nid >= MAX_NODES || bpf_map_lookup_elem(map_fd, &key, percpu))
-			continue;
-		for (int c = 0; c < ncpus; c++)
-			pages += percpu[c];
-		for (int i = 0; i < n; i++) {
-			if (containers[i].ino != (__u32)key.cgid)
-				continue;
-			containers[i].all_pages += pages;
-			if (nodes[key.nid].kill_secs >= KILL_SECS)
-				containers[i].node_pages += pages;
-			break;
-		}
+	/* one cgroup directory per container; its inode is its cgroup id */
+	while (dir && n < MAX_CONTAINERS && (d = readdir(dir))) {
+		snprintf(path, sizeof(path), CGROUP_ROOT "/%s", d->d_name);
+		if (d->d_name[0] != '.' && !stat(path, &st))
+			read_container(&containers[n++], d->d_name, st.st_ino,
+				       bpf_map__fd(skel->maps.allocs));
 	}
+	if (dir)
+		closedir(dir);
 
 	for (int i = 0; i < n; i++) {
 		struct container *c = &containers[i];
 
 		if (!c->node_pages)
-			continue;				/* 1. not on the node */
+			continue;					/* 1 */
 		c->node_kb = c->mem_kb * c->node_pages / c->all_pages;
-		if (c->node_kb * 100 < node_total_kb * SHARE_MIN_PCT)
-			continue;				/* 2. small share */
+		if (c->node_kb * 100 < kill_kb * SHARE_MIN_PCT)
+			continue;					/* 2 */
 		for (int t = 0; t < TOP_N; t++) {
 			if (top[t] && !kill_before(c, top[t]))
 				continue;
 			memmove(&top[t + 1], &top[t], (TOP_N - t - 1) * sizeof(top[0]));
-			top[t] = c;				/* 3. kill order */
+			top[t] = c;					/* 3 */
 			break;
 		}
 	}
@@ -471,9 +439,9 @@ static void find_culprits(int map_fd, __u64 *percpu, int ncpus, char *out, size_
 static void publish(enum verdict v, const char *who, const char *culprits, bool enforce,
 		    const struct host *h)
 {
-	static char last[512];
+	static char last[1024];
 	enum verdict shown = (v == KILL && !enforce) ? WARN : v;
-	char now[512];
+	char now[1024];
 	FILE *f;
 
 	snprintf(now, sizeof(now), "%s %s %s", verdict_name[v], who, culprits);
@@ -495,13 +463,11 @@ static void publish(enum verdict v, const char *who, const char *culprits, bool 
 	fprintf(f, "%ld verdict=%s nodes=%s culprits=%s dry_run=%d io_full=%.0f iowait=%.0f scan=%llu eff=%llu%%",
 		(long)time(NULL), verdict_name[v], who, culprits, !enforce, h->io_full, h->iowait,
 		h->scanned, h->scanned ? h->reclaimed * 100 / h->scanned : 100);
-	for (int i = 0; i < MAX_NODES; i++) {
-		const struct node *n = &nodes[i];
-
-		if (n->online)
-			fprintf(f, " node%d:free=%lluM,high=%lluM,file=%lluM,kswapd=%.0f%%",
-				i, n->free_kb >> 10, n->high_kb >> 10, n->file_kb >> 10, n->kswapd_pct);
-	}
+	for (int i = 0; i < MAX_NODES; i++)
+		if (nodes[i].online)
+			fprintf(f, " node%d:free=%lluM,high=%lluM,file=%lluM,kswapd=%.0f%%", i,
+				nodes[i].free_kb >> 10, nodes[i].high_kb >> 10,
+				nodes[i].file_kb >> 10, nodes[i].kswapd_pct);
 	fprintf(f, "\n");
 	fclose(f);
 }
@@ -509,71 +475,44 @@ static void publish(enum verdict v, const char *who, const char *culprits, bool 
 int main(int argc, char **argv)
 {
 	bool enforce = argc > 1 && !strcmp(argv[1], "--enforce");
-	char who[32] = "", buf[32], culprits[400] = "";
-	struct numaguard_bpf *skel;
-	struct bpf_link *link = NULL;
+	char who[32] = "", buf[32], culprits[600] = "";
 	enum verdict v, prev = OK;
-	time_t kill_since = 0;
-	__u64 *percpu;
+	time_t now, kill_since = 0;
 	struct host h;
-	int ncpus, map_fd = -1;
 
 	/* Must keep running while memory thrashes: never page ourselves out. */
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
 		perror("mlockall");
-	mkdir(RUN_DIR, 0755);
+	mkdir("/run/numaguard", 0755);
 	page_kb = sysconf(_SC_PAGESIZE) / 1024;
 	clk_tck = sysconf(_SC_CLK_TCK);
-	ncpus = libbpf_num_possible_cpus();
-	percpu = calloc(ncpus > 0 ? ncpus : 1, sizeof(*percpu));
 	find_kswapds();
 
-	/* Without BPF the verdicts still work; only the culprits are missing. */
-	skel = numaguard_bpf__open();
-	if (skel) {
-		read_node_end_pfns(skel->rodata->node_end_pfn);
-		if (numaguard_bpf__load(skel)) {
-			fprintf(stderr, "BPF load failed, running without culprits\n");
-			numaguard_bpf__destroy(skel);
-			skel = NULL;
-		} else {
-			map_fd = bpf_map__fd(skel->maps.allocs);
-		}
-	}
-
 	for (;;) {
-		time_t now;
-
 		read_nodes();
 		read_kswapds();
 		read_host(&h);
 		v = evaluate(&h, buf, sizeof(buf));
-
-		if (skel && tracing_wanted() && !link) {
-			clear_allocs(map_fd);
-			link = bpf_program__attach(skel->progs.handle_alloc);
-			if (libbpf_get_error(link))
-				link = NULL;
-		}
-
 		now = time(NULL);
+
+		if (!skel && tracing_wanted())
+			start_tracing();
+
 		if (prev == KILL && v != KILL && now - kill_since < KILL_HOLD_SECS) {
-			v = KILL;	/* give the NodeManager time to act */
+			v = KILL;		/* give the NodeManager time to act */
 		} else {
 			snprintf(who, sizeof(who), "%s", buf);
 			if (v != KILL)
 				culprits[0] = '\0';
-			else if (prev != KILL && link)	/* rank once, when kill starts */
-				find_culprits(map_fd, percpu, ncpus, culprits, sizeof(culprits));
+			else if (prev != KILL && skel)	/* rank once, when kill starts */
+				find_culprits(culprits, sizeof(culprits));
 		}
 		if (v == KILL && prev != KILL)
 			kill_since = now;
 		prev = v;
 
-		if (link && v == OK && !tracing_wanted()) {
-			bpf_link__destroy(link);
-			link = NULL;
-		}
+		if (skel && v == OK && !tracing_wanted())
+			stop_tracing();
 
 		publish(v, who, culprits, enforce, &h);
 		sleep(1);

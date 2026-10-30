@@ -1,50 +1,44 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * Pages allocated per (cgroup, NUMA node), from kmem:mm_page_alloc.
- *
- * Page allocation is a hot path, so numaguard attaches this only while a node
- * is heading for a hang, and uses it to name the containers that are filling
- * the thrashing node.
- */
+/* Pages allocated per (cgroup, NUMA node). numaguard loads this only around an incident. */
 #include <linux/types.h>
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include "numaguard.h"
 
-/* from /sys/kernel/debug/tracing/events/kmem/mm_page_alloc/format (5.4) */
-struct tp_mm_page_alloc {
+/* kmem:mm_page_alloc on 5.4: 8-byte common header, then pfn and order */
+struct page_alloc {
 	__u64 common;
 	__u64 pfn;
 	__u32 order;
-	__u32 gfp_flags;
 };
 
-/* exclusive end pfn of each node, in ascending order; set by numaguard */
+/* exclusive end pfn of each node, ascending; set by numaguard */
 const volatile __u64 node_end_pfn[MAX_NODES];
 
+/* key: cgroup id << 8 | node, value: pages */
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
-	__type(key, struct alloc_key);
+	__type(key, __u64);
 	__type(value, __u64);
 } allocs SEC(".maps");
 
 SEC("tp/kmem/mm_page_alloc")
-int handle_alloc(struct tp_mm_page_alloc *ctx)
+int handle_alloc(struct page_alloc *ctx)
 {
-	struct alloc_key key = { .cgid = bpf_get_current_cgroup_id(), .nid = MAX_NODES, .pad = 0 };
-	__u64 pages = 1ULL << (ctx->order & 15), *cnt;
+	__u64 nid = MAX_NODES, key, pages = 1ULL << (ctx->order & 15), *cnt;
 
 #pragma unroll
 	for (int i = MAX_NODES - 1; i >= 0; i--)
 		if (ctx->pfn < node_end_pfn[i])
-			key.nid = i;
-	if (key.nid == MAX_NODES)
+			nid = i;
+	if (nid == MAX_NODES)
 		return 0;
 
+	key = bpf_get_current_cgroup_id() << 8 | nid;
 	cnt = bpf_map_lookup_elem(&allocs, &key);
 	if (cnt)
-		*cnt += pages;
+		__sync_fetch_and_add(cnt, pages);
 	else
 		bpf_map_update_elem(&allocs, &key, &pages, BPF_NOEXIST);
 	return 0;
