@@ -24,12 +24,17 @@ The node whose kswapd stopped still has page cache, so it does not reach `kill`.
 `/run/numaguard/state` (tmpfs, replaced atomically):
 
 ```
-state=kill nodes=1 culprits=container_e2041_..._000826:9214M,container_..._001015:3120M since=1761000000
+state=kill nodes=1 culprits=container_e2041_..._000826:10100M,container_..._001015:22800M since=1761000000
 ```
 
-`culprits` are the (up to 3) containers under `/sys/fs/cgroup/yarn` that
-allocated the most pages on the thrashing node since tracing started. They are
-ranked once, when the kill verdict starts; NM can apply its own priority on top.
+`culprits` are up to 3 containers under `/sys/fs/cgroup/yarn`, with their
+`memory.current`. Candidates are the containers that allocated at least 10% as
+many pages on the thrashing node as the top allocator, since tracing started;
+they are ranked by `memory.current`, i.e. by what killing them would free.
+Allocations alone would rank page-cache churn (shuffle writes) first. Ranked
+once, when the kill verdict starts; NM can apply its own priority on top.
+A container that filled its memory before tracing started and has been idle
+since is not a candidate.
 
 ## Finding culprits (BPF)
 
@@ -41,8 +46,8 @@ is attached only while a node is in `warn` or is counting towards `kill`, and
 detached when everything is `ok` again. If BPF fails to load, the verdicts still
 work and `culprits` stays empty.
 
-Counts are gross allocations (frees are not subtracted), so page-cache churn
-counts too; the container growing its heap fastest still ranks first.
+Counts are gross allocations (frees are not subtracted), which is why they
+only select candidates and `memory.current` does the ranking.
 
 `/run/numaguard/events.log`: one line with all metrics each time the verdict changes.
 
