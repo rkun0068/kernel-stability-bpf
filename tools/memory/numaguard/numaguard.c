@@ -104,7 +104,7 @@ static void read_nodes(void)
 /* kswapd threads are named "kswapd<nid>"; find their pids once at startup */
 static void find_kswapds(void)
 {
-	char path[64], comm[32];
+	char path[300], comm[32];
 	struct dirent *d;
 	DIR *proc = opendir("/proc");
 	int nid;
