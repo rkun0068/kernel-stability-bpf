@@ -3,8 +3,9 @@ Description=NUMA node thrashing guard
 After=local-fs.target
 
 [Service]
-# Dry run: kill verdicts are only logged. Add --enforce once validated.
+# Rules: /etc/numaguard/rules.d/*.rules. Reload after editing them.
 ExecStart=/usr/local/sbin/numaguard
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 RuntimeDirectory=numaguard

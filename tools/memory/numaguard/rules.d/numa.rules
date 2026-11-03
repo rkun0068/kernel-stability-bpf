@@ -1,0 +1,18 @@
+# NUMA-node thrashing that precedes a host hang, for Spark executors on YARN.
+# Thresholds from 5 hangs on 4 hosts; see ../README.md.
+
+scope	/sys/fs/cgroup/yarn		# one cgroup directory per container
+prio	file=__spark_conf__/__spark_conf__.properties key=spark.yarn.queue high=*-prod
+mode	dry				# kill verdicts are only logged
+
+# A node's kswapd gave up while its free memory stays below the high watermark.
+rule numa_kswapd_stopped
+  when node.kswapd < 1  node.free_over_high < 0		for 10m
+  do   warn
+
+# The host is stalled on IO and reclaim scans hard but frees almost nothing,
+# while a node has no page cache left and free memory near its watermark.
+rule numa_thrash
+  when host.psi.io.full >= 80  host.iowait >= 80  host.scan >= 600000  host.eff <= 10
+  when node.file < 1G  node.free_over_high < 1G		for 60s
+  do   kill top=3 cooldown=5m
