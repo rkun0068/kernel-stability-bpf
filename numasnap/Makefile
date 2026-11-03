@@ -1,19 +1,14 @@
-CLANG ?= clang
-CC    ?= gcc
+CC ?= gcc
 
-all: numasnap numasnap.bpf.o test/snapkill
+all: numasnap test/snapkill
 
-numasnap.bpf.o: numasnap.bpf.c numasnap.h
-	$(CLANG) -O2 -g -target bpf -c $< -o $@
-
-# shared libraries are fine: mlockall() at startup locks them in memory too
-numasnap: numasnap.c numasnap.h
-	$(CC) -O2 -Wall -o $@ $< -lbpf -lelf -lz
+numasnap: numasnap.c
+	$(CC) -O2 -Wall -o $@ $<
 
 test/snapkill: test/snapkill.c
 	$(CC) -O2 -Wall -o $@ $<
 
 clean:
-	rm -f numasnap numasnap.bpf.o test/snapkill
+	rm -f numasnap test/snapkill
 
 .PHONY: all clean

@@ -31,11 +31,10 @@
  *   DIR/snapshot   host metrics, per-node memory, then the containers under
  *                  --scope sorted by anonymous memory on the full node
  *   DIR/events     stage changes (held 5s), trigger, snapshot (top 3),
- *                  recovering, healthy,
- *                  plus SIGKILLs seen by eBPF
+ *                  recovering, healthy
  *
  * It must keep running while the system disk is saturated: after setup it
- * only touches procfs, sysfs, BPF maps and DIR (put it on tmpfs), and holds
+ * only touches procfs, sysfs and DIR (put it on tmpfs), and holds
  * its memory with mlockall().
  */
 #define _GNU_SOURCE
@@ -53,12 +52,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/types.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
-
-#include "numasnap.h"
 
 #define VERSION		1
+#define NS_MAX_NODES	8
 #define GiB		(1ULL << 30)
 #define KPF_ANON	(1ULL << 12)
 #define KPF_THP_TAIL	(1ULL << 16)
@@ -66,11 +62,11 @@
 #define MAX_ZONES	4
 
 static struct {
-	const char *scope, *dir, *bpf;
+	const char *scope, *dir;
 	double io, mem, eff, anon;
 	int hold, samples;
 } cfg = {
-	.scope = "/sys/fs/cgroup", .dir = "/run/numasnap", .bpf = "numasnap.bpf.o",
+	.scope = "/sys/fs/cgroup", .dir = "/run/numasnap",
 	.io = 80,			/* IO PSI full avg10; 6 hangs peak 96-98, other days <= 77 */
 	.mem = 80,			/* memory PSI full avg10; 6 hangs peak 88-98, other days <= 73 */
 	.eff = 10,			/* sar -B in hangs: 2-9%, normally above 90% */
@@ -258,67 +254,6 @@ static void sample(void)
 	}
 }
 
-/* ---- eBPF ---- */
-
-static int map_kswapd = -1, map_refault = -1, map_kills = -1, map_seq = -1;
-
-static void bpf_setup(void)
-{
-	struct bpf_object *obj = bpf_object__open_file(cfg.bpf, NULL);
-	struct bpf_program *p;
-
-	if (libbpf_get_error(obj) || bpf_object__load(obj)) {
-		fprintf(stderr, "eBPF %s not loaded, continuing without it\n", cfg.bpf);
-		return;
-	}
-	bpf_object__for_each_program(p, obj)
-		if (libbpf_get_error(bpf_program__attach(p)))
-			fprintf(stderr, "eBPF: cannot attach %s\n", bpf_program__name(p));
-	map_kswapd = bpf_object__find_map_fd_by_name(obj, "kswapd_stat");
-	map_refault = bpf_object__find_map_fd_by_name(obj, "refault");
-	map_kills = bpf_object__find_map_fd_by_name(obj, "kills");
-	map_seq = bpf_object__find_map_fd_by_name(obj, "kill_seq");
-}
-
-static const char *kswapd(int n)
-{
-	struct ns_kswapd k = { 0 };
-	__u32 key = n;
-
-	if (map_kswapd < 0)
-		return "unknown";
-	bpf_map_lookup_elem(map_kswapd, &key, &k);
-	return k.last_wake_ns > k.last_sleep_ns ? "running" : "asleep";
-}
-
-static __u64 refaults(__u64 cgid)
-{
-	__u64 v = 0;
-
-	if (map_refault >= 0)
-		bpf_map_lookup_elem(map_refault, &cgid, &v);
-	return v;
-}
-
-static void kill_events(void)
-{
-	static __u64 seen;
-	__u64 seq = 0;
-	__u32 i = 0;
-
-	if (map_seq < 0)
-		return;
-	bpf_map_lookup_elem(map_seq, &i, &seq);
-	for (; seen < seq; seen++) {
-		struct ns_kill k;
-
-		i = seen % NS_KILL_RING;
-		if (!bpf_map_lookup_elem(map_kills, &i, &k))
-			event("sigkill sender=%s/%u target=%s/%u", k.sender_comm, k.sender_pid,
-			      k.target_comm, k.target_pid);
-	}
-}
-
 /* ---- setup ---- */
 
 static void setup(void)
@@ -385,10 +320,10 @@ static void snapshot(const struct metrics *m, const struct metrics *prev)
 	    m->scan - prev->scan, m->steal - prev->steal, m->refault - prev->refault,
 	    m->majflt - prev->majflt, target, state);
 	for (n = 0; n < nodes; n++)
-		put("node=%d total=%llu free=%llu file=%llu anon=%llu high=%llu kswapd=%s\n",
-		    n, m->total[n], m->free[n], m->file[n], m->anon[n], high[n], kswapd(n));
+		put("node=%d total=%llu free=%llu file=%llu anon=%llu high=%llu\n",
+		    n, m->total[n], m->free[n], m->file[n], m->anon[n], high[n]);
 	for (c = 0; c < ncont; c++) {
-		put("name=%s cgid=%llu refault=%llu", cont[c].name, cont[c].cgid, refaults(cont[c].cgid));
+		put("name=%s cgid=%llu", cont[c].name, cont[c].cgid);
 		for (n = 0; n < nodes; n++)
 			put(" anon%d=%llu", n, cont[c].anon[n]);
 		put("\n");
@@ -431,7 +366,7 @@ static int healthy(const struct metrics *m, const struct metrics *prev)
 int main(int argc, char **argv)
 {
 	static const struct option opts[] = {
-		{ "scope", 1, 0, 's' }, { "dir", 1, 0, 'd' }, { "bpf", 1, 0, 'b' },
+		{ "scope", 1, 0, 's' }, { "dir", 1, 0, 'd' },
 		{ "io", 1, 0, 'i' }, { "mem", 1, 0, 'M' }, { "eff", 1, 0, 'e' }, { "anon", 1, 0, 'a' },
 		{ "hold", 1, 0, 'h' }, { "samples", 1, 0, 'n' }, { 0 }
 	};
@@ -442,7 +377,6 @@ int main(int argc, char **argv)
 		switch (c) {
 		case 's': cfg.scope = optarg; break;
 		case 'd': cfg.dir = optarg; break;
-		case 'b': cfg.bpf = optarg; break;
 		case 'i': cfg.io = atof(optarg); break;
 		case 'M': cfg.mem = atof(optarg); break;
 		case 'e': cfg.eff = atof(optarg); break;
@@ -450,7 +384,7 @@ int main(int argc, char **argv)
 		case 'h': cfg.hold = atoi(optarg); break;
 		case 'n': cfg.samples = atoi(optarg); break;
 		default:
-			fprintf(stderr, "usage: %s [--scope DIR] [--dir DIR] [--bpf FILE]\n"
+			fprintf(stderr, "usage: %s [--scope DIR] [--dir DIR]\n"
 				"  [--io N] [--mem N] [--eff PCT] [--anon PCT] [--hold SEC] [--samples N]\n", argv[0]);
 			return 2;
 		}
@@ -458,7 +392,6 @@ int main(int argc, char **argv)
 
 	/* everything that may read the disk happens before mlockall() */
 	setup();
-	bpf_setup();
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
 		perror("mlockall");
 	/* ahead of the tasks that hog the CPUs in reclaim; it sleeps most of the time */
@@ -501,6 +434,5 @@ int main(int argc, char **argv)
 			snapshot(&m, &prev);
 		if (!active)
 			well = 0;
-		kill_events();
 	}
 }
