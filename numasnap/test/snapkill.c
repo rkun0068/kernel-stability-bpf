@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +43,14 @@ static unsigned long long field(const char *line, const char *key)
 	const char *p = strstr(line, key);
 
 	return p ? strtoull(p + strlen(key), NULL, 10) : 0;
+}
+
+/* state=trigger, whatever field follows it */
+static int is_trigger(const char *snap)
+{
+	const char *p = strstr(snap, " state=");
+
+	return p && !strncmp(p + 7, "trigger", 7) && (p[14] == ' ' || p[14] == '\n');
 }
 
 static int kill_cgroup(const char *cg)
@@ -102,6 +111,8 @@ int main(int argc, char **argv)
 	snprintf(path, sizeof(path), "%s/snapshot", dir);
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
 		perror("mlockall");
+	if (setpriority(PRIO_PROCESS, 0, -20))	/* ahead of the tasks stuck in reclaim */
+		perror("setpriority");
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	for (;; sleep(1)) {
@@ -119,14 +130,18 @@ int main(int argc, char **argv)
 		/* numasnap refreshes the snapshot every second while the host stalls */
 		if (!slurp(path, snap, sizeof(snap)) || now - (time_t)field(snap, "ts=") > 3 || kills >= max_kills)
 			continue;
-		/* a snapshot taken before the last one went still says trigger */
-		if ((time_t)field(snap, "ts=") <= gone_at)
+		/* written in place: a read that crossed a write has seq= and end= apart */
+		if (field(snap, " seq=") != field(snap, "\nend="))
+			continue;
+		/* state= was decided at mts=, before sampling: one decided before the
+		 * last victim went still says trigger */
+		if ((time_t)field(snap, " mts=") <= gone_at)
 			continue;
 		target = field(snap, "target=");
 		snprintf(key, sizeof(key), "\nnode=%d ", target);
 		line = strstr(snap, key);
 		/* the snapshot keeps coming until the host is healthy: act only on trigger */
-		if (!line || !strstr(snap, " state=trigger\n"))
+		if (!line || !is_trigger(snap))
 			continue;
 		snprintf(key, sizeof(key), " anon%d=", target);
 		for (line = snap; line; line = next) {

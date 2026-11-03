@@ -14,13 +14,15 @@
  *                 (the reads saturate the disk) or memory PSI full avg10
  *                 >= --mem (they are stuck in reclaim before reading)
  *
- * Once stage 3 holds for --hold seconds it samples every node's page frames and
- * writes every second until the host is healthy, with state= in the snapshot:
+ * From stage 1 on it samples every node's page frames once a minute to rank
+ * the containers: in the stall itself sampling can take a minute. Once stage
+ * 3 holds for --hold seconds it writes, every second until the host is
+ * healthy, a snapshot with that ranking and state=:
  *
  *   trigger      stage 3 holds: act on the snapshot
  *   recovering   stage 3 is gone but the host is not healthy yet: wait
  *   healthy      held for 30s, the last snapshot: all of
- *                  the node: anon < 85%, or free + file > high watermark + 5G
+ *                  the node: anon < 85%, or free > high watermark
  *                  reclaim frees > 70% of what it scans (vmpressure "low" is > 67%),
  *                  or barely scans
  *                  IO and memory PSI full avg10 < 40
@@ -68,7 +70,8 @@ static struct {
 } cfg = {
 	.scope = "/sys/fs/cgroup", .dir = "/run/numasnap",
 	.io = 80,			/* IO PSI full avg10; 6 hangs peak 96-98, other days <= 77 */
-	.mem = 80,			/* memory PSI full avg10; 6 hangs peak 88-98, other days <= 73 */
+	.mem = 60,			/* memory PSI full avg10; systemd-oomd's default. 6 hangs peak
+					 * 88-98; one other day spiked to 73 for under a minute */
 	.eff = 10,			/* sar -B in hangs: 2-9%, normally above 90% */
 	.anon = 90,			/* 6 hangs: reached 1-3h before, peak 95-97% */
 	.hold = 30, .samples = 100000,
@@ -84,48 +87,72 @@ static void put(const char *fmt, ...)
 	va_start(ap, fmt);
 	olen += vsnprintf(out + olen, sizeof(out) - olen, fmt, ap);
 	va_end(ap);
-	if (olen >= (int)sizeof(out))
-		olen = sizeof(out) - 1;
+	if (olen >= (int)sizeof(out) - 32)	/* keep room for the end= line */
+		olen = sizeof(out) - 32;
 }
 
-/* write out[] to dir/name: whole file replaced at once, readers never see half */
-static void publish(const char *name)
+/*
+ * In the stall every new page a write needs goes through direct reclaim: a new
+ * tmpfs file each second blocked numasnap for minutes. So both files get their
+ * pages once at start and are overwritten in place from then on.
+ */
+#define EVENTS_MAX	(1 << 20)
+
+static int open_prealloc(const char *name, off_t len)
 {
-	char tmp[256], dst[256];
+	char path[256];
 	int fd;
 
-	snprintf(tmp, sizeof(tmp), "%s/.%s", cfg.dir, name);
-	snprintf(dst, sizeof(dst), "%s/%s", cfg.dir, name);
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd >= 0 && write(fd, out, olen) == olen)
-		rename(tmp, dst);
-	if (fd >= 0)
-		close(fd);
+	snprintf(path, sizeof(path), "%s/%s", cfg.dir, name);
+	fd = open(path, O_RDWR | O_CREAT, 0644);
+	if (fd < 0 || fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, len)) {
+		fprintf(stderr, "cannot preallocate %s\n", path);
+		exit(1);
+	}
+	return fd;
+}
+
+/*
+ * snapshot: out[] padded with NULs to a fixed size and written over the
+ * previous one. A reader can catch half of each, so the first line carries
+ * seq= and the last line end= with the same number: anything else is torn.
+ */
+static int fd_snap;	/* opened at start, before any stall */
+
+static void publish(void)
+{
+	memset(out + olen, 0, sizeof(out) - olen);
+	if (pwrite(fd_snap, out, sizeof(out), 0) < 0) {
+		/* nothing to do: the next second writes it again */
+	}
 	olen = 0;
 }
 
-/* events: appended, restarted at 1M; tmpfs, so it cannot block */
+/* events: appended, restarted at 1M */
 static void event(const char *fmt, ...)
 {
 	static int fd = -1;
+	static off_t len;
 	char line[512];
 	va_list ap;
 	int n;
 
 	if (fd < 0) {
-		snprintf(line, sizeof(line), "%s/events", cfg.dir);
-		fd = open(line, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		fd = open_prealloc("events", EVENTS_MAX + sizeof(line));
+		len = lseek(fd, 0, SEEK_END);
 	}
 	n = snprintf(line, sizeof(line), "ts=%ld ", (long)time(NULL));
 	va_start(ap, fmt);
 	n += vsnprintf(line + n, sizeof(line) - n - 1, fmt, ap);
 	va_end(ap);
 	line[n++] = '\n';
-	if (lseek(fd, 0, SEEK_END) > (1 << 20))
+	if (len > EVENTS_MAX) {		/* truncating frees the pages: take them again */
 		ftruncate(fd, 0);
-	if (write(fd, line, n) < 0) {
-		/* nothing to do */
+		fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, EVENTS_MAX + sizeof(line));
+		len = 0;
 	}
+	if (pwrite(fd, line, n, len) == n)
+		len += n;
 }
 
 /* ---- metrics ---- */
@@ -137,6 +164,7 @@ static int nzone[NS_MAX_NODES];
 static int fd_psi, fd_mem, fd_stat, fd_vmstat, fd_flags, fd_cg, fd_meminfo[NS_MAX_NODES];
 
 struct metrics {
+	time_t at;		/* when read: state= in a snapshot describes this moment */
 	double io, mem;
 	__u64 cpu, iowait, scan, steal, refault, majflt;
 	__u64 total[NS_MAX_NODES], free[NS_MAX_NODES], file[NS_MAX_NODES], anon[NS_MAX_NODES];
@@ -163,6 +191,7 @@ static void read_metrics(struct metrics *m)
 	const char *b;
 	__u64 v[8] = { 0 };
 
+	m->at = time(NULL);
 	b = strstr(slurp(fd_psi), "full avg10=");
 	m->io = b ? atof(b + 11) : 0;
 	b = strstr(slurp(fd_mem), "full avg10=");
@@ -304,21 +333,27 @@ static int by_target_anon(const void *a, const void *b)
 	return x < y ? 1 : x > y ? -1 : 0;
 }
 
-static void snapshot(const struct metrics *m, const struct metrics *prev)
-{
-	int c, n;
-	time_t now;
+static time_t ranked;	/* when containers were last listed and sampled */
 
+static void rank(void)
+{
 	list_containers();
 	sample();
-	qsort(cont, ncont, sizeof(cont[0]), by_target_anon);
-	now = time(NULL);	/* sampling can take seconds in a stall: stamp when done */
+	ranked = time(NULL);
+}
 
-	put("version=%d ts=%ld io_full=%.1f mem_full=%.1f iowait=%.1f scan=%llu steal=%llu refault=%llu majflt=%llu target=%d state=%s\n",
-	    VERSION, (long)now, m->io, m->mem,
+static void snapshot(const struct metrics *m, const struct metrics *prev)
+{
+	static unsigned seq;
+	int c, n;
+	time_t now = time(NULL);
+
+	qsort(cont, ncont, sizeof(cont[0]), by_target_anon);
+	put("version=%d seq=%u ts=%ld io_full=%.1f mem_full=%.1f iowait=%.1f scan=%llu steal=%llu refault=%llu majflt=%llu target=%d state=%s mts=%ld ranked=%ld\n",
+	    VERSION, ++seq, (long)now, m->io, m->mem,
 	    m->cpu > prev->cpu ? 100.0 * (m->iowait - prev->iowait) / (m->cpu - prev->cpu) : 0,
 	    m->scan - prev->scan, m->steal - prev->steal, m->refault - prev->refault,
-	    m->majflt - prev->majflt, target, state);
+	    m->majflt - prev->majflt, target, state, (long)m->at, (long)ranked);
 	for (n = 0; n < nodes; n++)
 		put("node=%d total=%llu free=%llu file=%llu anon=%llu high=%llu\n",
 		    n, m->total[n], m->free[n], m->file[n], m->anon[n], high[n]);
@@ -328,21 +363,26 @@ static void snapshot(const struct metrics *m, const struct metrics *prev)
 			put(" anon%d=%llu", n, cont[c].anon[n]);
 		put("\n");
 	}
-	publish("snapshot");
+	put("end=%u\n", seq);
+	publish();
 	event("snapshot target=%d top=%s:%llu,%s:%llu,%s:%llu", target,
 	      ncont > 0 ? cont[0].name : "-", ncont > 0 ? cont[0].anon[target] : 0,
 	      ncont > 1 ? cont[1].name : "-", ncont > 1 ? cont[1].anon[target] : 0,
 	      ncont > 2 ? cont[2].name : "-", ncont > 2 ? cont[2].anon[target] : 0);
 }
 
-/* stage of the hang (see top); *full is set to the node that is full */
-static int stage(const struct metrics *m, const struct metrics *prev, int *full)
+/*
+ * stage of the hang (see top); *full is set to the node that is full. With
+ * only >= 0 just that node counts: once triggered, another full node must not
+ * keep the trigger alive while PSI, a 10s average, is still coming down.
+ */
+static int stage(const struct metrics *m, const struct metrics *prev, int only, int *full)
 {
 	__u64 scan;
 	int n;
 
 	for (*full = -1, n = 0; n < nodes; n++)
-		if (100.0 * m->anon[n] >= cfg.anon * m->total[n] &&
+		if ((only < 0 || n == only) && 100.0 * m->anon[n] >= cfg.anon * m->total[n] &&
 		    (*full < 0 || m->free[n] + m->file[n] < m->free[*full] + m->file[*full]))
 			*full = n;
 	if (*full < 0)
@@ -358,7 +398,7 @@ static int healthy(const struct metrics *m, const struct metrics *prev)
 	__u64 scan = m->scan - prev->scan;
 
 	return (100 * m->anon[target] < 85 * m->total[target] ||
-		m->free[target] + m->file[target] > high[target] + (5ULL << 30)) &&
+		m->free[target] > high[target]) &&		/* kswapd's own "balanced" */
 	       (scan < 1000 || 100.0 * (m->steal - prev->steal) / scan > 70) &&
 	       m->io < 40 && m->mem < 40;
 }
@@ -390,8 +430,9 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* everything that may read the disk happens before mlockall() */
+	/* everything that may read the disk or take new pages happens here */
 	setup();
+	fd_snap = open_prealloc("snapshot", sizeof(out));
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
 		perror("mlockall");
 	/* ahead of the tasks that hog the CPUs in reclaim; it sleeps most of the time */
@@ -406,7 +447,7 @@ int main(int argc, char **argv)
 	for (;; prev = m) {
 		sleep(1);
 		read_metrics(&m);
-		st = stage(&m, &prev, &full);
+		st = stage(&m, &prev, active ? target : -1, &full);
 
 		/* log a stage once it has lasted 5s, so a flickering metric stays quiet */
 		cand_n = st == cand ? cand_n + 1 : 1, cand = st;
@@ -415,8 +456,15 @@ int main(int argc, char **argv)
 			      st, full, full < 0 ? 0 : m.free[full], full < 0 ? 0 : m.file[full],
 			      m.scan - prev.scan, m.steal - prev.steal, m.refault - prev.refault, m.io, m.mem), shown = st;
 
+		/* rank while the host still responds; a minute old is fine, a
+		 * container's memory barely moves while the node is full */
+		if (!active && st >= 1 && time(NULL) - ranked >= 60)
+			rank();
+
 		held = st == 3 ? held + 1 : 0;
 		if (!active && held >= cfg.hold) {
+			if (!ranked)	/* jumped to stage 3 without passing stage 1 */
+				rank();
 			/* kept until healthy, so freeing it does not move the ranking elsewhere */
 			target = full;
 			event("trigger node=%d io_full=%.1f mem_full=%.1f refault=%llu", target, m.io, m.mem, m.refault - prev.refault);
